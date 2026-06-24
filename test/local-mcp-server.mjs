@@ -1,0 +1,540 @@
+#!/usr/bin/env node
+import http from "node:http";
+import { randomUUID } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import * as z from "zod/v4";
+
+const ONE_BY_ONE_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+function createFixtureServer() {
+  const server = new McpServer(
+    {
+      name: "pi-mcp-fixture",
+      version: "1.0.0",
+    },
+    {
+      capabilities: {
+        logging: {},
+      },
+    },
+  );
+
+  server.registerTool(
+    "echo",
+    {
+      title: "Echo",
+      description: "Echo a message back as text.",
+      inputSchema: {
+        message: z.string().describe("Message to echo"),
+      },
+    },
+    async ({ message }, extra) => {
+      await server.sendLoggingMessage({ level: "info", data: `echo:${message}` }, extra.sessionId);
+      return {
+        content: [{ type: "text", text: `echo:${message}` }],
+      };
+    },
+  );
+
+  server.registerTool(
+    "structured",
+    {
+      title: "Structured",
+      description: "Return structured content and text content.",
+      inputSchema: {
+        label: z.string().describe("Label for the structured result"),
+        count: z.number().int().default(1).describe("Count to return"),
+      },
+      outputSchema: {
+        label: z.string(),
+        count: z.number(),
+        ok: z.boolean(),
+      },
+    },
+    async ({ label, count }) => {
+      const structuredContent = { label, count, ok: true };
+      return {
+        content: [{ type: "text", text: JSON.stringify(structuredContent) }],
+        structuredContent,
+      };
+    },
+  );
+
+  server.registerTool(
+    "image",
+    {
+      title: "Image",
+      description: "Return a tiny PNG image.",
+      inputSchema: {},
+    },
+    async () => ({
+      content: [{ type: "image", mimeType: "image/png", data: ONE_BY_ONE_PNG }],
+    }),
+  );
+
+  server.registerTool(
+    "resource_content",
+    {
+      title: "Resource Content",
+      description: "Return MCP resource content from a tool.",
+      inputSchema: {},
+    },
+    async () => ({
+      content: [
+        {
+          type: "resource",
+          resource: {
+            uri: "test://text",
+            mimeType: "text/plain",
+            text: "embedded resource text",
+          },
+        },
+      ],
+    }),
+  );
+
+  server.registerTool(
+    "fail",
+    {
+      title: "Fail",
+      description: "Return an MCP tool error result.",
+      inputSchema: {},
+    },
+    async () => ({
+      isError: true,
+      content: [{ type: "text", text: "fixture failure" }],
+    }),
+  );
+
+  server.registerTool(
+    "elicit_form",
+    {
+      title: "Elicit Form",
+      description: "Request form input from the MCP client.",
+      inputSchema: {},
+    },
+    async () => {
+      const result = await server.server.elicitInput({
+        mode: "form",
+        message: "Fixture form request",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              title: "Name",
+              description: "Name to return",
+            },
+            count: {
+              type: "integer",
+              title: "Count",
+              description: "Count to return",
+              default: 1,
+            },
+            confirm: {
+              type: "boolean",
+              title: "Confirm",
+              description: "Confirmation flag",
+              default: true,
+            },
+            color: {
+              type: "string",
+              title: "Color",
+              enum: ["red", "green", "blue"],
+              default: "green",
+            },
+          },
+          required: ["name", "count", "confirm", "color"],
+        },
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
+      };
+    },
+  );
+
+  server.registerTool(
+    "list_roots",
+    {
+      title: "List Roots",
+      description: "Ask the MCP client for roots.",
+      inputSchema: {},
+    },
+    async () => {
+      const roots = await server.server.listRoots();
+      return {
+        content: [{ type: "text", text: JSON.stringify(roots) }],
+        structuredContent: roots,
+      };
+    },
+  );
+
+  server.registerTool(
+    "notify_tools_changed",
+    {
+      title: "Notify Tools Changed",
+      description: "Send a tools/list_changed notification.",
+      inputSchema: {},
+    },
+    async () => {
+      server.sendToolListChanged();
+      return {
+        content: [{ type: "text", text: "sent tools/list_changed" }],
+      };
+    },
+  );
+
+  server.registerResource(
+    "text-resource",
+    "test://text",
+    {
+      title: "Text Resource",
+      description: "Fixture text resource",
+      mimeType: "text/plain",
+    },
+    async () => ({
+      contents: [{ uri: "test://text", mimeType: "text/plain", text: "fixture resource text" }],
+    }),
+  );
+
+  server.registerResource(
+    "image-resource",
+    "test://image",
+    {
+      title: "Image Resource",
+      description: "Fixture image resource",
+      mimeType: "image/png",
+    },
+    async () => ({
+      contents: [{ uri: "test://image", mimeType: "image/png", blob: ONE_BY_ONE_PNG }],
+    }),
+  );
+
+  server.registerPrompt(
+    "review",
+    {
+      title: "Review Prompt",
+      description: "Create a review prompt for a topic.",
+      argsSchema: {
+        topic: z.string().describe("Topic to review"),
+      },
+    },
+    ({ topic }) => ({
+      messages: [
+        {
+          role: "user",
+          content: { type: "text", text: `Review ${topic} from the fixture prompt.` },
+        },
+      ],
+    }),
+  );
+
+  return server;
+}
+
+async function startStdio() {
+  const server = createFixtureServer();
+  await server.connect(new StdioServerTransport());
+  console.error("pi-mcp fixture server running on stdio");
+}
+
+async function startHttp() {
+  const port = Number(process.env.PI_MCP_FIXTURE_PORT ?? readArg("--port") ?? 38765);
+  const sessions = new Map();
+  const oauth = process.argv.includes("--oauth") ? createOAuthFixtureState() : undefined;
+  const nodeServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+    if (oauth && (await handleOAuthFixtureRoute(req, res, url, oauth))) return;
+
+    if (url.pathname !== "/mcp") {
+      res.writeHead(404).end("not found");
+      return;
+    }
+
+    try {
+      if (oauth && !authorizeMcpRequest(req, res, oauth)) return;
+
+      const sessionId = req.headers["mcp-session-id"];
+      let session = typeof sessionId === "string" ? sessions.get(sessionId) : undefined;
+      if (!session && !sessionId) {
+        const server = createFixtureServer();
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (initializedSessionId) => {
+            sessions.set(initializedSessionId, { server, transport });
+          },
+        });
+        transport.onclose = () => {
+          if (transport.sessionId) sessions.delete(transport.sessionId);
+        };
+        await server.connect(transport);
+        session = { server, transport };
+      }
+
+      if (!session) {
+        res.writeHead(400, { "content-type": "application/json" }).end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Bad Request: No valid MCP session ID provided" },
+            id: null,
+          }),
+        );
+        return;
+      }
+
+      const { server, transport } = session;
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("fixture HTTP error:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" }).end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32603, message: "Internal server error" },
+            id: null,
+          }),
+        );
+      }
+    }
+  });
+
+  await new Promise((resolve) => nodeServer.listen(port, "127.0.0.1", resolve));
+  const address = nodeServer.address();
+  const actualPort = typeof address === "object" && address ? address.port : port;
+  const origin = `http://127.0.0.1:${actualPort}`;
+  console.log(JSON.stringify({ url: `${origin}/mcp`, statsUrl: `${origin}/fixture/stats`, expireUrl: `${origin}/fixture/expire` }));
+
+  const shutdown = () => {
+    for (const { server, transport } of sessions.values()) {
+      void transport.close();
+      void server.close();
+    }
+    nodeServer.close(() => process.exit(0));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+function createOAuthFixtureState() {
+  return {
+    clients: new Map(),
+    codes: new Map(),
+    accessTokens: new Map(),
+    refreshTokens: new Map(),
+    sequence: 0,
+    stats: {
+      registrations: 0,
+      authorizationCodes: 0,
+      authorizationCodeGrants: 0,
+      refreshGrants: 0,
+      protectedRequests: 0,
+    },
+  };
+}
+
+async function handleOAuthFixtureRoute(req, res, url, oauth) {
+  const origin = url.origin;
+  if (url.pathname === "/.well-known/oauth-protected-resource/mcp" || url.pathname === "/.well-known/oauth-protected-resource") {
+    sendJson(res, 200, {
+      resource: `${origin}/mcp`,
+      authorization_servers: [origin],
+      bearer_methods_supported: ["header"],
+      scopes_supported: ["mcp:tools"],
+    });
+    return true;
+  }
+
+  if (url.pathname === "/.well-known/oauth-authorization-server") {
+    sendJson(res, 200, {
+      issuer: origin,
+      authorization_endpoint: `${origin}/authorize`,
+      token_endpoint: `${origin}/token`,
+      registration_endpoint: `${origin}/register`,
+      scopes_supported: ["mcp:tools"],
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      token_endpoint_auth_methods_supported: ["none"],
+      code_challenge_methods_supported: ["S256"],
+    });
+    return true;
+  }
+
+  if (url.pathname === "/register" && req.method === "POST") {
+    const body = JSON.parse(await readBody(req));
+    if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0) {
+      sendOAuthError(res, 400, "invalid_client_metadata", "redirect_uris is required");
+      return true;
+    }
+    const client = {
+      ...body,
+      client_id: `client-${randomUUID()}`,
+      client_id_issued_at: Math.floor(Date.now() / 1000),
+      token_endpoint_auth_method: "none",
+    };
+    oauth.clients.set(client.client_id, client);
+    oauth.stats.registrations++;
+    sendJson(res, 201, client);
+    return true;
+  }
+
+  if (url.pathname === "/authorize" && req.method === "GET") {
+    const clientId = url.searchParams.get("client_id");
+    const redirectUri = url.searchParams.get("redirect_uri");
+    const codeChallenge = url.searchParams.get("code_challenge");
+    const client = clientId ? oauth.clients.get(clientId) : undefined;
+    if (!client || !redirectUri || !codeChallenge || !client.redirect_uris.includes(redirectUri)) {
+      sendOAuthError(res, 400, "invalid_request", "invalid authorization request");
+      return true;
+    }
+    const code = `code-${randomUUID()}`;
+    oauth.codes.set(code, {
+      clientId,
+      codeChallenge,
+      redirectUri,
+      resource: url.searchParams.get("resource") ?? undefined,
+      scope: url.searchParams.get("scope") ?? "",
+    });
+    oauth.stats.authorizationCodes++;
+
+    const redirect = new URL(redirectUri);
+    redirect.searchParams.set("code", code);
+    const state = url.searchParams.get("state");
+    if (state) redirect.searchParams.set("state", state);
+    res.writeHead(302, { location: redirect.href }).end();
+    return true;
+  }
+
+  if (url.pathname === "/token" && req.method === "POST") {
+    const params = new URLSearchParams(await readBody(req));
+    const grantType = params.get("grant_type");
+    const clientId = params.get("client_id");
+    if (!clientId || !oauth.clients.has(clientId)) {
+      sendOAuthError(res, 401, "invalid_client", "unknown client");
+      return true;
+    }
+
+    if (grantType === "authorization_code") {
+      const code = params.get("code");
+      const codeData = code ? oauth.codes.get(code) : undefined;
+      if (!code || !codeData || codeData.clientId !== clientId) {
+        sendOAuthError(res, 400, "invalid_grant", "invalid authorization code");
+        return true;
+      }
+      oauth.codes.delete(code);
+      oauth.stats.authorizationCodeGrants++;
+      sendJson(res, 200, issueTokens(oauth, codeData));
+      return true;
+    }
+
+    if (grantType === "refresh_token") {
+      const refreshToken = params.get("refresh_token");
+      const refreshData = refreshToken ? oauth.refreshTokens.get(refreshToken) : undefined;
+      if (!refreshToken || !refreshData || refreshData.clientId !== clientId) {
+        sendOAuthError(res, 400, "invalid_grant", "invalid refresh token");
+        return true;
+      }
+      oauth.refreshTokens.delete(refreshToken);
+      oauth.stats.refreshGrants++;
+      sendJson(res, 200, issueTokens(oauth, refreshData));
+      return true;
+    }
+
+    sendOAuthError(res, 400, "unsupported_grant_type", "unsupported grant type");
+    return true;
+  }
+
+  if (url.pathname === "/fixture/stats") {
+    sendJson(res, 200, oauthStats(oauth));
+    return true;
+  }
+
+  if (url.pathname === "/fixture/expire") {
+    for (const token of oauth.accessTokens.values()) token.expiresAt = Date.now() - 1000;
+    sendJson(res, 200, oauthStats(oauth));
+    return true;
+  }
+
+  return false;
+}
+
+function issueTokens(oauth, input) {
+  const accessToken = `access-${++oauth.sequence}`;
+  const refreshToken = `refresh-${++oauth.sequence}`;
+  const tokenData = {
+    clientId: input.clientId,
+    resource: input.resource,
+    scope: input.scope ?? "",
+    expiresAt: Date.now() + 60 * 60 * 1000,
+  };
+  oauth.accessTokens.set(accessToken, tokenData);
+  oauth.refreshTokens.set(refreshToken, tokenData);
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    token_type: "Bearer",
+    expires_in: 3600,
+    scope: tokenData.scope,
+  };
+}
+
+function authorizeMcpRequest(req, res, oauth) {
+  const header = req.headers.authorization;
+  const match = typeof header === "string" ? /^Bearer (.+)$/.exec(header) : undefined;
+  const token = match ? oauth.accessTokens.get(match[1]) : undefined;
+  if (!token || token.expiresAt < Date.now()) {
+    sendBearerChallenge(req, res, token ? "Token has expired" : "Missing or invalid bearer token");
+    return false;
+  }
+  oauth.stats.protectedRequests++;
+  return true;
+}
+
+function sendBearerChallenge(req, res, description) {
+  const origin = `http://${req.headers.host || "127.0.0.1"}`;
+  const resourceMetadata = `${origin}/.well-known/oauth-protected-resource/mcp`;
+  res
+    .writeHead(401, {
+      "content-type": "application/json",
+      "www-authenticate": `Bearer error="invalid_token", error_description="${description}", resource_metadata="${resourceMetadata}", scope="mcp:tools"`,
+    })
+    .end(JSON.stringify({ error: "invalid_token", error_description: description }));
+}
+
+function oauthStats(oauth) {
+  return {
+    ...oauth.stats,
+    clients: oauth.clients.size,
+    authorizationCodes: oauth.codes.size,
+    accessTokens: oauth.accessTokens.size,
+    refreshTokens: oauth.refreshTokens.size,
+  };
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+}
+
+function sendOAuthError(res, status, error, errorDescription) {
+  sendJson(res, status, { error, error_description: errorDescription });
+}
+
+async function readBody(req) {
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  return body;
+}
+
+function readArg(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+if (process.argv.includes("--http")) {
+  await startHttp();
+} else {
+  await startStdio();
+}
