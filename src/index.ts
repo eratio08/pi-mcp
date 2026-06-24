@@ -401,7 +401,7 @@ function formatStatus(name: string, serverConfig: McpConfig["servers"][string] |
 function showCommandMessage(pi: ExtensionAPI, title: string, content: string) {
   pi.sendMessage(
     {
-      customType: "pi-opencode-mcp",
+      customType: "pi-mcp",
       content: `## ${title}\n\n${content}`,
       display: true,
       details: { title },
