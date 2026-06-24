@@ -40,11 +40,15 @@ export interface RemoteMcpConfig {
 /** Parsed configuration for one local or remote MCP server. */
 export type McpServerConfig = LocalMcpConfig | RemoteMcpConfig;
 
+/** Controls whether MCP tools are exposed individually or hidden behind the single mcp gateway tool. */
+export type McpToolMode = "direct" | "proxy";
+
 /** Parsed MCP configuration and the source it came from, when loaded from a file. */
 export interface McpConfig {
   readonly timeout?: number;
   readonly servers: Readonly<Record<string, McpServerConfig>>;
   readonly source?: string;
+  readonly toolMode?: McpToolMode;
 }
 
 /** OAuth tokens stored for one MCP server. */

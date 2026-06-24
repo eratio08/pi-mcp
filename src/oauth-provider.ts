@@ -77,7 +77,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
     const clientInfo: AuthClientInfo = {
       clientId: info.client_id,
-      ...(info.client_secret !== undefined ? { clientSecret: info.client_secret } : {}),
+      ...(nonEmptyString(info.client_secret) ? { clientSecret: info.client_secret } : {}),
       ...(info.client_id_issued_at !== undefined ? { clientIdIssuedAt: info.client_id_issued_at } : {}),
       ...(info.client_secret_expires_at !== undefined ? { clientSecretExpiresAt: info.client_secret_expires_at } : {}),
     };
@@ -107,9 +107,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
   async saveTokens(tokens: OAuthTokens): Promise<void> {
     const authTokens: AuthTokens = {
       accessToken: tokens.access_token,
-      ...(tokens.refresh_token !== undefined ? { refreshToken: tokens.refresh_token } : {}),
+      ...(nonEmptyString(tokens.refresh_token) ? { refreshToken: tokens.refresh_token } : {}),
       ...(tokens.expires_in !== undefined ? { expiresAt: Date.now() / 1000 + tokens.expires_in } : {}),
-      ...(tokens.scope !== undefined ? { scope: tokens.scope } : {}),
+      ...(nonEmptyString(tokens.scope) ? { scope: tokens.scope } : {}),
     };
     await this.auth.updateTokens(
       this.mcpName,
@@ -164,6 +164,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
     const next = type === "client" ? withoutClient : withoutTokens;
     await this.auth.set(this.mcpName, next);
   }
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 /** Parses a configured redirect URI into the callback listener port and path. */

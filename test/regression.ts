@@ -12,9 +12,11 @@ import { root } from "./helpers.js";
 
 async function main() {
   await rejectsInvalidServerConfig();
+  await loadsProxyToolMode();
   await rejectsMissingEnvironmentPlaceholder();
   redactsDisplayTargets();
   await rejectsMalformedAuthStoreData();
+  await acceptsEmptyOptionalAuthStrings();
   await rejectsUnavailableOAuthCallbackPort();
   await handlesClientCloseCallbackRejections();
   await rejectsDynamicToolKeyCollisions();
@@ -38,6 +40,27 @@ async function rejectsInvalidServerConfig() {
   );
 
   await assert.rejects(() => loadMcpConfig({ cwd: dir }), /mcp\.broken\.url must be a non-empty string/);
+}
+
+async function loadsProxyToolMode() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-proxy-config-"));
+  await writeFile(
+    path.join(dir, "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        toolMode: "proxy",
+        local: {
+          type: "local",
+          command: ["fixture-server"],
+        },
+      },
+    }),
+  );
+
+  const config = await loadMcpConfig({ cwd: dir });
+  assert.equal(config.toolMode, "proxy");
+  assert.equal(config.servers.local?.type, "local");
+  assert.deepEqual(config.servers.local.type === "local" ? config.servers.local.command : [], ["fixture-server"]);
 }
 
 async function rejectsMissingEnvironmentPlaceholder() {
@@ -95,6 +118,40 @@ async function rejectsMalformedAuthStoreData() {
   } finally {
     console.warn = previousWarn;
   }
+}
+
+async function acceptsEmptyOptionalAuthStrings() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-auth-empty-strings-"));
+  const file = path.join(dir, "auth.json");
+  await writeFile(
+    file,
+    JSON.stringify({
+      oauth: {
+        tokens: {
+          accessToken: "access-token",
+          refreshToken: "",
+          scope: "",
+        },
+        clientInfo: {
+          clientId: "client-id",
+          clientSecret: "",
+        },
+        codeVerifier: "",
+        oauthState: "",
+        serverUrl: "https://example.test/mcp",
+      },
+    }),
+  );
+
+  const store = new AuthStore(file);
+  const entry = await store.get("oauth");
+  assert.equal(entry?.tokens?.accessToken, "access-token");
+  assert.equal(entry?.tokens?.refreshToken, "");
+  assert.equal(entry?.tokens?.scope, "");
+  assert.equal(entry?.clientInfo?.clientSecret, "");
+  assert.equal(entry?.codeVerifier, "");
+  assert.equal(entry?.oauthState, "");
+  assert.equal(await store.authStatus("oauth"), "authenticated");
 }
 
 function redactsDisplayTargets() {

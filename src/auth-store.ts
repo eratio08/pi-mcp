@@ -191,11 +191,11 @@ function parseAuthEntry(value: unknown): AuthEntry | undefined {
   const clientInfo = parseAuthClientInfo(value.clientInfo);
   if ("clientInfo" in value && !clientInfo) return undefined;
   const codeVerifier = optionalString(value.codeVerifier);
-  if ("codeVerifier" in value && !codeVerifier) return undefined;
+  if ("codeVerifier" in value && codeVerifier === undefined) return undefined;
   const oauthState = optionalString(value.oauthState);
-  if ("oauthState" in value && !oauthState) return undefined;
+  if ("oauthState" in value && oauthState === undefined) return undefined;
   const serverUrl = optionalString(value.serverUrl);
-  if ("serverUrl" in value && !serverUrl) return undefined;
+  if ("serverUrl" in value && serverUrl === undefined) return undefined;
 
   return {
     ...(tokens !== undefined ? { tokens } : {}),
@@ -208,13 +208,13 @@ function parseAuthEntry(value: unknown): AuthEntry | undefined {
 
 function parseAuthTokens(value: unknown): AuthTokens | undefined {
   if (value === undefined) return undefined;
-  if (!isPlainRecord(value) || typeof value.accessToken !== "string" || value.accessToken.length === 0) return undefined;
+  if (!isPlainRecord(value) || typeof value.accessToken !== "string") return undefined;
   const refreshToken = optionalString(value.refreshToken);
-  if ("refreshToken" in value && !refreshToken) return undefined;
+  if ("refreshToken" in value && refreshToken === undefined) return undefined;
   const expiresAt = optionalNumber(value.expiresAt);
   if ("expiresAt" in value && expiresAt === undefined) return undefined;
   const scope = optionalString(value.scope);
-  if ("scope" in value && !scope) return undefined;
+  if ("scope" in value && scope === undefined) return undefined;
 
   return {
     accessToken: value.accessToken,
@@ -226,9 +226,9 @@ function parseAuthTokens(value: unknown): AuthTokens | undefined {
 
 function parseAuthClientInfo(value: unknown): AuthClientInfo | undefined {
   if (value === undefined) return undefined;
-  if (!isPlainRecord(value) || typeof value.clientId !== "string" || value.clientId.length === 0) return undefined;
+  if (!isPlainRecord(value) || typeof value.clientId !== "string") return undefined;
   const clientSecret = optionalString(value.clientSecret);
-  if ("clientSecret" in value && !clientSecret) return undefined;
+  if ("clientSecret" in value && clientSecret === undefined) return undefined;
   const clientIdIssuedAt = optionalNumber(value.clientIdIssuedAt);
   if ("clientIdIssuedAt" in value && clientIdIssuedAt === undefined) return undefined;
   const clientSecretExpiresAt = optionalNumber(value.clientSecretExpiresAt);
@@ -243,7 +243,7 @@ function parseAuthClientInfo(value: unknown): AuthClientInfo | undefined {
 }
 
 function optionalString(value: unknown) {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+  return typeof value === "string" ? value : undefined;
 }
 
 function optionalNumber(value: unknown) {

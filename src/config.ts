@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
-import type { McpConfig, McpServerConfig, OAuthConfig } from "./types.js";
+import type { McpConfig, McpServerConfig, McpToolMode, OAuthConfig } from "./types.js";
 import { expandEnv, resolveHome } from "./config-values.js";
 
 interface LoadOptions {
@@ -68,6 +68,7 @@ function parseConfig(text: string, source: string): McpConfig {
 function parseMcpSection(section: Record<string, unknown>, source: string, pathLabel: string, entryMode: ServerEntryMode): McpConfig {
   const servers: Record<string, McpServerConfig> = {};
   const timeout = parseOptionalPositiveInt(section.timeout, `${pathLabel}.timeout`, source);
+  const toolMode = parseToolMode(section, pathLabel, source);
 
   if ("servers" in section) {
     if (!isPlainRecord(section.servers)) {
@@ -76,16 +77,33 @@ function parseMcpSection(section: Record<string, unknown>, source: string, pathL
     for (const [name, raw] of Object.entries(section.servers)) {
       servers[name] = parseServer(raw, timeout, `${pathLabel}.servers.${name}`, source);
     }
-    return makeConfig(source, servers, timeout);
+    return makeConfig(source, servers, timeout, toolMode);
   }
 
   for (const [name, raw] of Object.entries(section)) {
-    if (name === "timeout") continue;
+    if (name === "timeout" || name === "toolMode" || name === "mode" || name === "proxy") continue;
     if (entryMode === "discover" && !looksLikeServerEntry(raw)) continue;
     servers[name] = parseServer(raw, timeout, `${pathLabel}.${name}`, source);
   }
 
-  return makeConfig(source, servers, timeout);
+  return makeConfig(source, servers, timeout, toolMode);
+}
+
+function parseToolMode(section: Record<string, unknown>, pathLabel: string, source: string): McpToolMode | undefined {
+  const rawMode = section.toolMode ?? section.mode;
+  if (rawMode !== undefined) {
+    if (rawMode !== "direct" && rawMode !== "proxy") {
+      throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.toolMode must be "direct" or "proxy"`);
+    }
+    return rawMode;
+  }
+  if (section.proxy !== undefined) {
+    if (typeof section.proxy !== "boolean") {
+      throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.proxy must be a boolean`);
+    }
+    return section.proxy ? "proxy" : "direct";
+  }
+  return undefined;
 }
 
 function parseServer(value: unknown, defaultTimeout: number | undefined, pathLabel: string, source: string): McpServerConfig {
@@ -207,8 +225,13 @@ function parseOptionalPositiveInt(value: unknown, pathLabel: string, source: str
   return value;
 }
 
-function makeConfig(source: string, servers: Record<string, McpServerConfig>, timeout: number | undefined): McpConfig {
-  return { servers, source, ...(timeout !== undefined ? { timeout } : {}) };
+function makeConfig(
+  source: string,
+  servers: Record<string, McpServerConfig>,
+  timeout: number | undefined,
+  toolMode: McpToolMode | undefined,
+): McpConfig {
+  return { servers, source, ...(timeout !== undefined ? { timeout } : {}), ...(toolMode !== undefined ? { toolMode } : {}) };
 }
 
 function looksLikeFlatMcpSection(section: Record<string, unknown>) {

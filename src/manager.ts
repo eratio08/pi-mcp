@@ -511,9 +511,17 @@ export class McpManager {
 
     try {
       await transport.finishAuth(authorizationCode);
+      const exchangedEntry = await this.auth.get(name);
       await this.auth.clearCodeVerifier(name);
       this.pendingOAuthTransports.delete(name);
-      return this.connect(name);
+      const status = await this.connect(name);
+      if (status.status === "needs_auth" && exchangedEntry?.tokens) {
+        return {
+          status: "failed",
+          error: "OAuth callback completed and an access token was issued, but the server rejected it on reconnect. The token may have an incompatible audience/resource for this MCP endpoint.",
+        } satisfies McpStatus;
+      }
+      return status;
     } catch (error) {
       return { status: "failed", error: errorMessage(error) } satisfies McpStatus;
     }

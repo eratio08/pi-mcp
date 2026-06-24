@@ -76,13 +76,39 @@ Also supported:
 - `/mcp-prompts` lists MCP prompts from connected servers.
 - `/mcp-prompt <server> <prompt> [json args]` fetches an MCP prompt and sends it as a user message.
 
-Connected MCP tools are registered as Pi tools using OpenCode's sanitized name convention:
+By default, connected MCP tools are registered as Pi tools using OpenCode's sanitized name convention:
 
 ```text
 <server>_<tool>
 ```
 
-The extension also registers `list_mcp_resources` and `read_mcp_resource` when any connected server supports MCP resources.
+To hide individual MCP tools from the system prompt and expose only a progressive-disclosure gateway, set `toolMode` (or `mode`) to `"proxy"`:
+
+```jsonc
+{
+  "mcp": {
+    "toolMode": "proxy",
+    "playwright": {
+      "type": "local",
+      "command": ["npx", "-y", "@playwright/mcp"]
+    }
+  }
+}
+```
+
+Proxy usage:
+
+```js
+mcp({})                                      // status
+mcp({ server: "playwright" })              // list one server's tools
+mcp({ search: "screenshot" })              // search tools
+mcp({ describe: "playwright_take_screenshot" })
+mcp({ tool: "playwright_take_screenshot", args: '{"fullPage":true}' })
+mcp({ action: "resources", server: "docs" })
+mcp({ action: "read-resource", server: "docs", uri: "file://..." })
+```
+
+The extension also registers `list_mcp_resources` and `read_mcp_resource` in direct mode when any connected server supports MCP resources. In proxy mode, resources are available through the `mcp` gateway actions instead.
 
 ## Elicitation
 
