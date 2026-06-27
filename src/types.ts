@@ -1,6 +1,8 @@
 /** Runtime connection status for one configured MCP server. */
 export type McpStatus =
   | { readonly status: "connected" }
+  | { readonly status: "connecting" }
+  | { readonly status: "disconnected" }
   | { readonly status: "disabled" }
   | { readonly status: "failed"; readonly error: string }
   | { readonly status: "needs_auth" }
@@ -43,12 +45,45 @@ export type McpServerConfig = LocalMcpConfig | RemoteMcpConfig;
 /** Controls whether MCP tools are exposed individually or hidden behind the single mcp gateway tool. */
 export type McpToolMode = "direct" | "proxy";
 
+/** Controls whether configured MCP servers connect automatically after startup or only on demand. */
+export type McpStartupMode = "eager" | "lazy";
+
+/** Names whether a connection request is automatic lazy/eager work or explicit user intent. */
+export type McpConnectIntent = "automatic" | "explicit";
+
+/** Common options for MCP operations that can observe caller-owned cancellation. */
+export interface CancellableOptions {
+  readonly signal: AbortSignal | undefined;
+}
+
+/** Options for connecting one configured MCP server. */
+export interface McpConnectOptions extends CancellableOptions {
+  readonly intent: McpConnectIntent;
+}
+
+/** Options for connecting all eligible configured MCP servers. */
+export interface McpConnectAllOptions extends CancellableOptions {
+  readonly intent: McpConnectIntent;
+}
+
+/** Parsed operation for applying a new MCP configuration. */
+export type McpInitializeOptions =
+  | {
+      readonly mode: "configure-only";
+    }
+  | {
+      readonly mode: "connect";
+      readonly intent: McpConnectIntent;
+      readonly signal: AbortSignal | undefined;
+    };
+
 /** Parsed MCP configuration and the source it came from, when loaded from a file. */
 export interface McpConfig {
   readonly timeout?: number;
   readonly servers: Readonly<Record<string, McpServerConfig>>;
   readonly source?: string;
   readonly toolMode?: McpToolMode;
+  readonly startup?: McpStartupMode;
 }
 
 /** OAuth tokens stored for one MCP server. */

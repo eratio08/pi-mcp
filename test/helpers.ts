@@ -29,6 +29,7 @@ export async function callTool(manager: McpManager, key: string, args: Record<st
     tool: entry.tool,
     args,
     timeout: entry.timeout,
+    signal: undefined,
   });
 }
 

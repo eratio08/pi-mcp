@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
-import type { McpConfig, McpServerConfig, McpToolMode, OAuthConfig } from "./types.js";
+import type { McpConfig, McpServerConfig, McpStartupMode, McpToolMode, OAuthConfig } from "./types.js";
 import { expandEnv, resolveHome } from "./config-values.js";
 
 interface LoadOptions {
@@ -24,7 +24,7 @@ export async function loadMcpConfig(options: LoadOptions): Promise<McpConfig> {
   for (const file of candidateConfigFiles(options.cwd)) {
     if (!existsSync(file)) continue;
     const parsed = parseConfig(await readFile(file, "utf8"), file);
-    if (Object.keys(parsed.servers).length > 0 || parsed.timeout !== undefined) return parsed;
+    if (hasConfigContent(parsed)) return parsed;
   }
 
   return { servers: {} };
@@ -69,6 +69,7 @@ function parseMcpSection(section: Record<string, unknown>, source: string, pathL
   const servers: Record<string, McpServerConfig> = {};
   const timeout = parseOptionalPositiveInt(section.timeout, `${pathLabel}.timeout`, source);
   const toolMode = parseToolMode(section, pathLabel, source);
+  const startup = parseStartupMode(section, pathLabel, source);
 
   if ("servers" in section) {
     if (!isPlainRecord(section.servers)) {
@@ -77,16 +78,16 @@ function parseMcpSection(section: Record<string, unknown>, source: string, pathL
     for (const [name, raw] of Object.entries(section.servers)) {
       servers[name] = parseServer(raw, timeout, `${pathLabel}.servers.${name}`, source);
     }
-    return makeConfig(source, servers, timeout, toolMode);
+    return makeConfig(source, servers, timeout, toolMode, startup);
   }
 
   for (const [name, raw] of Object.entries(section)) {
-    if (name === "timeout" || name === "toolMode" || name === "mode" || name === "proxy") continue;
+    if (name === "timeout" || name === "toolMode" || name === "mode" || name === "proxy" || name === "startup") continue;
     if (entryMode === "discover" && !looksLikeServerEntry(raw)) continue;
     servers[name] = parseServer(raw, timeout, `${pathLabel}.${name}`, source);
   }
 
-  return makeConfig(source, servers, timeout, toolMode);
+  return makeConfig(source, servers, timeout, toolMode, startup);
 }
 
 function parseToolMode(section: Record<string, unknown>, pathLabel: string, source: string): McpToolMode | undefined {
@@ -104,6 +105,14 @@ function parseToolMode(section: Record<string, unknown>, pathLabel: string, sour
     return section.proxy ? "proxy" : "direct";
   }
   return undefined;
+}
+
+function parseStartupMode(section: Record<string, unknown>, pathLabel: string, source: string): McpStartupMode | undefined {
+  if (section.startup === undefined) return undefined;
+  if (section.startup !== "eager" && section.startup !== "lazy") {
+    throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.startup must be "eager" or "lazy"`);
+  }
+  return section.startup;
 }
 
 function parseServer(value: unknown, defaultTimeout: number | undefined, pathLabel: string, source: string): McpServerConfig {
@@ -230,8 +239,24 @@ function makeConfig(
   servers: Record<string, McpServerConfig>,
   timeout: number | undefined,
   toolMode: McpToolMode | undefined,
+  startup: McpStartupMode | undefined,
 ): McpConfig {
-  return { servers, source, ...(timeout !== undefined ? { timeout } : {}), ...(toolMode !== undefined ? { toolMode } : {}) };
+  return {
+    servers,
+    source,
+    ...(timeout !== undefined ? { timeout } : {}),
+    ...(toolMode !== undefined ? { toolMode } : {}),
+    ...(startup !== undefined ? { startup } : {}),
+  };
+}
+
+function hasConfigContent(config: McpConfig) {
+  return (
+    Object.keys(config.servers).length > 0 ||
+    config.timeout !== undefined ||
+    config.toolMode !== undefined ||
+    config.startup !== undefined
+  );
 }
 
 function looksLikeFlatMcpSection(section: Record<string, unknown>) {

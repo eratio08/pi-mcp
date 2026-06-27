@@ -6,10 +6,10 @@ import type { TSchema } from "typebox";
 import { Type } from "typebox";
 import { callMcpTool, formatResourceContent, formatResourceList, toolParameters } from "./catalog.js";
 import { loadMcpConfig } from "./config.js";
-import { formatMcpServerTarget } from "./display.js";
+import { formatMcpServerTarget, redactSecrets } from "./display.js";
 import { handlePiElicitation } from "./elicitation.js";
 import { McpManager, type McpToolEntry } from "./manager.js";
-import type { McpConfig, McpStatus } from "./types.js";
+import type { CancellableOptions, McpConfig, McpStatus } from "./types.js";
 import { optionalString, requiredString } from "./tool-args.js";
 
 const MCP_PROXY_TOOL = "mcp";
@@ -50,6 +50,8 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
   let config: McpConfig = { servers: {} };
   let registeredToolNames = new Set<string>();
   let latestContext: ExtensionContext | undefined;
+  let configGeneration = 0;
+  let backgroundConnectionRefresh: Promise<void> | undefined;
   const elicitationContexts = new AsyncLocalStorage<ExtensionContext | undefined>();
 
   async function ensureManager(ctx: ExtensionContext) {
@@ -65,15 +67,39 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     return manager;
   }
 
-  async function loadAndConnect(ctx: ExtensionContext) {
+  async function loadConfigured(ctx: ExtensionContext) {
     latestContext = ctx;
+    const generation = configGeneration + 1;
+    configGeneration = generation;
     config = await loadMcpConfig({ cwd: ctx.cwd });
     const activeManager = await ensureManager(ctx);
     const previous = registeredToolNames;
     registeredToolNames = new Set();
-    await activeManager.initialize(config);
+    await activeManager.initialize(config, { mode: "configure-only" });
     registerDynamicTools();
     deactivateTools([...previous].filter((name) => !registeredToolNames.has(name)));
+    return { activeManager, generation };
+  }
+
+  async function connectConfiguredServers(activeManager: McpManager, generation: number) {
+    await activeManager.connectAll({
+      intent: "automatic",
+      signal: undefined,
+    });
+    if (manager !== activeManager || configGeneration !== generation) return;
+    registerDynamicTools();
+  }
+
+  function startBackgroundConnectionRefresh(ctx: ExtensionContext, activeManager: McpManager, generation: number) {
+    backgroundConnectionRefresh = (async () => {
+      await connectConfiguredServers(activeManager, generation);
+      if (manager !== activeManager || configGeneration !== generation) return;
+      updateMcpStatus(ctx);
+    })().catch((error: unknown) => {
+      if (manager !== activeManager || configGeneration !== generation) return;
+      console.error(`[mcp] background connection refresh failed: ${safeErrorSummary(error)}`);
+      updateMcpStatus(ctx);
+    });
   }
 
   function registerDynamicTools() {
@@ -110,7 +136,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
             tool: latest.tool,
             args: isPlainRecord(params) ? params : {},
             timeout: latest.timeout,
-            ...(signal ? { signal } : {}),
+            signal,
           };
           return elicitationContexts.run(ctx ?? latestContext, () => callMcpTool(toolInput));
         },
@@ -175,16 +201,17 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     if (connect) return proxyConnect(connect);
 
     const describe = optionalString(args, "describe");
-    if (describe) return proxyDescribe(describe, server);
+    if (describe) return proxyDescribe(describe, server, signal);
 
     const search = optionalString(args, "search");
-    if (search) return proxySearch(search, typeof args.regex === "boolean" ? args.regex : false, server);
+    if (search) return proxySearch(search, typeof args.regex === "boolean" ? args.regex : false, server, signal);
 
-    if (server) return proxyList(server);
+    if (server) return proxyList(server, signal);
     return proxyStatus();
   }
 
   async function proxyCall(toolName: string, args: Record<string, unknown>, server: string | undefined, signal: AbortSignal | undefined) {
+    await ensureProxyToolMetadata(toolName, server, { signal });
     const found = findProxyTool(toolName, server);
     if ("error" in found) return proxyText(found.error, found.details);
     return callMcpTool({
@@ -192,17 +219,21 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       tool: found.entry.tool,
       args,
       timeout: found.entry.timeout,
-      ...(signal ? { signal } : {}),
+      signal,
     });
   }
 
   async function proxyConnect(server: string) {
-    const status = await requireManager().connect(server);
+    const status = await requireManager().connect(server, {
+      intent: "explicit",
+      signal: undefined,
+    });
     registerDynamicTools();
     return proxyText(formatStatus(server, config.servers[server], status), { mode: "connect", server, status: status.status });
   }
 
-  function proxyDescribe(toolName: string, server: string | undefined) {
+  async function proxyDescribe(toolName: string, server: string | undefined, signal: AbortSignal | undefined) {
+    await ensureProxyToolMetadata(toolName, server, { signal });
     const found = findProxyTool(toolName, server);
     if ("error" in found) return proxyText(found.error, found.details);
     return proxyText(formatProxyToolDescription(found.entry), {
@@ -213,9 +244,10 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     });
   }
 
-  function proxySearch(query: string, regex: boolean, server: string | undefined) {
+  async function proxySearch(query: string, regex: boolean, server: string | undefined, signal: AbortSignal | undefined) {
     const pattern = buildSearchPattern(query, regex);
     if ("error" in pattern) return proxyText(pattern.error, pattern.details);
+    await ensureProxySearchMetadata(server, { signal });
     const matches = proxyToolEntries()
       .filter((entry) => !server || entry.server === server)
       .filter((entry) => pattern.pattern.test(`${entry.key}\n${entry.name}\n${entry.server}\n${entry.tool.description ?? ""}`))
@@ -251,7 +283,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     });
   }
 
-  function proxyList(server: string) {
+  async function proxyList(server: string, signal: AbortSignal | undefined) {
     if (!config.servers[server]) {
       return proxyText(`MCP server "${server}" is not configured. Use mcp({}) to see available servers.`, {
         mode: "list",
@@ -259,6 +291,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         error: "server_not_found",
       });
     }
+    await ensureProxyServerConnected(server, { signal });
     const entries = proxyToolEntries().filter((entry) => entry.server === server).sort((a, b) => a.key.localeCompare(b.key));
     if (entries.length === 0) {
       const status = requireManager().status()[server]?.status ?? "disabled";
@@ -283,6 +316,8 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
   }
 
   async function proxyResources(server: string | undefined, signal: AbortSignal | undefined) {
+    if (server) await ensureProxyServerConnected(server, { signal });
+    else await ensureProxyServersConnected({ signal });
     const resourceServers = resourceServerNames();
     if (server && !resourceServers.includes(server)) {
       return proxyText(`MCP server "${server}" does not support resources. Available resource servers: ${resourceServers.join(", ") || "none"}.`, {
@@ -291,7 +326,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         error: "resources_not_supported",
       });
     }
-    const result = await requireManager().resources(server, signal ? { signal } : {});
+    const result = await requireManager().resources(server, { signal });
     const sorted = [...result.resources].sort((a, b) =>
       `${a.client}\u0000${a.name}\u0000${a.uri}`.localeCompare(`${b.client}\u0000${b.name}\u0000${b.uri}`),
     );
@@ -311,7 +346,8 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
   async function proxyReadResource(server: string | undefined, uri: string | undefined, signal: AbortSignal | undefined) {
     if (!server) return proxyText("read-resource requires `server`.", { mode: "read-resource", error: "missing_server" });
     if (!uri) return proxyText("read-resource requires `uri`.", { mode: "read-resource", server, error: "missing_uri" });
-    const content = await requireManager().readResource(server, uri, signal ? { signal } : {});
+    await ensureProxyServerConnected(server, { signal });
+    const content = await requireManager().readResource(server, uri, { signal });
     const formatted = formatResourceContent(server, uri, content);
     return {
       content: [{ type: "text" as const, text: formatted.text }, ...formatted.images],
@@ -339,6 +375,47 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       servers: servers.map(([name]) => ({ name, status: statuses[name]?.status ?? "disabled", tools: entries.filter((entry) => entry.server === name).length })),
       totalTools: entries.length,
     });
+  }
+
+  async function ensureProxyToolMetadata(toolName: string, server: string | undefined, options: CancellableOptions) {
+    if (server) {
+      await ensureProxyServerConnected(server, options);
+      return;
+    }
+
+    const found = findProxyTool(toolName, undefined);
+    if (!("error" in found)) return;
+    await ensureProxyServersConnected(options);
+  }
+
+  async function ensureProxySearchMetadata(server: string | undefined, options: CancellableOptions) {
+    if (server) {
+      await ensureProxyServerConnected(server, options);
+      return;
+    }
+    await ensureProxyServersConnected(options);
+  }
+
+  async function ensureProxyServerConnected(server: string, options: CancellableOptions) {
+    if (!config.servers[server]) return;
+
+    await requireManager().connect(server, {
+      intent: "automatic",
+      signal: options.signal,
+    });
+
+    registerDynamicTools();
+    updateLatestMcpStatus();
+  }
+
+  async function ensureProxyServersConnected(options: CancellableOptions) {
+    await requireManager().connectAll({
+      intent: "automatic",
+      signal: options.signal,
+    });
+
+    registerDynamicTools();
+    updateLatestMcpStatus();
   }
 
   function proxyToolEntries() {
@@ -388,7 +465,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
               : `MCP server "${parsed.server}" does not support resources. Available resource servers: ${resourceServers.join(", ")}`,
           );
         }
-        const result = await requireManager().resources(parsed.server, signal ? { signal } : {});
+        const result = await requireManager().resources(parsed.server, { signal });
         const sorted = [...result.resources].sort((a, b) =>
           `${a.client}\u0000${a.name}\u0000${a.uri}`.localeCompare(`${b.client}\u0000${b.name}\u0000${b.uri}`),
         );
@@ -422,7 +499,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       },
       async execute(_toolCallId, params, signal) {
         const parsed = parseReadResourceArgs(params);
-        const content = await requireManager().readResource(parsed.server, parsed.uri, signal ? { signal } : {});
+        const content = await requireManager().readResource(parsed.server, parsed.uri, { signal });
         const formatted = formatResourceContent(parsed.server, parsed.uri, content);
         return {
           content: [{ type: "text", text: formatted.text }, ...formatted.images],
@@ -446,6 +523,18 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       .sort((a, b) => a.localeCompare(b));
   }
 
+  function updateLatestMcpStatus() {
+    const ctx = latestContext;
+    if (ctx) updateMcpStatus(ctx);
+  }
+
+  function updateMcpStatus(ctx: ExtensionContext) {
+    const count = Object.values(manager?.status() ?? {}).filter((status) => status.status === "connected").length;
+    if (ctx.hasUI && Object.keys(config.servers).length > 0) {
+      ctx.ui.setStatus("mcp", `${count} MCP`);
+    }
+  }
+
   function activateTools(names: string[]) {
     if (names.length === 0) return;
     const active = new Set(pi.getActiveTools());
@@ -462,15 +551,17 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     latestContext = ctx;
-    await loadAndConnect(ctx);
-    const count = Object.values(manager?.status() ?? {}).filter((status) => status.status === "connected").length;
-    if (ctx.hasUI && Object.keys(config.servers).length > 0) {
-      ctx.ui.setStatus("mcp", `${count} MCP`);
-    }
+    const loaded = await loadConfigured(ctx);
+    updateMcpStatus(ctx);
+    if (startupMode(config) === "eager") startBackgroundConnectionRefresh(ctx, loaded.activeManager, loaded.generation);
   });
 
   pi.on("session_shutdown", async () => {
+    configGeneration += 1;
+    const pendingConnectionRefresh = backgroundConnectionRefresh;
+    backgroundConnectionRefresh = undefined;
     await manager?.close();
+    if (pendingConnectionRefresh) await Promise.race([pendingConnectionRefresh, Promise.resolve()]);
     manager = undefined;
     registeredToolNames = new Set();
   });
@@ -486,7 +577,13 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
   pi.registerCommand("mcp-reload", {
     description: "Reload MCP config and reconnect servers",
     handler: async (_args, ctx) => {
-      await loadAndConnect(ctx);
+      const loaded = await loadConfigured(ctx);
+      await loaded.activeManager.connectAll({
+        intent: "explicit",
+        signal: undefined,
+      });
+      registerDynamicTools();
+      updateMcpStatus(ctx);
       showCommandMessage(pi, "MCP Reloaded", await statusText(requireManager(), config));
     },
   });
@@ -501,8 +598,12 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         return;
       }
       await ensureManager(ctx);
-      const status = await requireManager().connect(name);
+      const status = await requireManager().connect(name, {
+        intent: "explicit",
+        signal: undefined,
+      });
       registerDynamicTools();
+      updateMcpStatus(ctx);
       showCommandMessage(pi, `MCP Connect: ${name}`, formatStatus(name, config.servers[name], status));
     },
   });
@@ -519,6 +620,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       await ensureManager(ctx);
       await requireManager().disconnect(name);
       registerDynamicTools();
+      updateMcpStatus(ctx);
       showCommandMessage(pi, `MCP Disconnect: ${name}`, `Disconnected ${name}`);
     },
   });
@@ -542,6 +644,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         showCommandMessage(pi, "Open MCP OAuth URL", url);
       });
       registerDynamicTools();
+      updateMcpStatus(ctx);
       showCommandMessage(pi, `MCP Auth: ${name}`, formatStatus(name, config.servers[name], status));
     },
   });
@@ -565,7 +668,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     description: "List prompts exposed by connected MCP servers",
     handler: async (_args, ctx) => {
       await ensureManager(ctx);
-      const result = await requireManager().prompts();
+      const result = await requireManager().prompts({ signal: undefined });
       const prompts = result.prompts;
       const text =
         prompts.length === 0
@@ -591,7 +694,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /mcp-prompt <server> <prompt> [json args]", "warning");
         return;
       }
-      const prompt = await requireManager().getPrompt(parsed.server, parsed.prompt, parsed.args);
+      const prompt = await requireManager().getPrompt(parsed.server, parsed.prompt, parsed.args, { signal: undefined });
       const text =
         prompt.messages
           ?.map((message) => {
@@ -639,6 +742,10 @@ function proxyText(text: string, details: Record<string, unknown>) {
 
 function useProxyTool(config: McpConfig) {
   return config.toolMode === "proxy";
+}
+
+function startupMode(config: McpConfig) {
+  return config.startup ?? "lazy";
 }
 
 function buildSearchPattern(query: string, regex: boolean): { pattern: RegExp } | { error: string; details: Record<string, unknown> } {
@@ -715,6 +822,10 @@ function formatStatus(name: string, serverConfig: McpConfig["servers"][string] |
         ? "\n  Run /mcp-auth to authenticate."
         : "";
   return `${name}: ${status.status}${target ? `\n  ${target}` : ""}${detail}`;
+}
+
+function safeErrorSummary(error: unknown) {
+  return error instanceof Error ? `${error.name}: ${redactSecrets(error.message)}` : `thrown ${typeof error}`;
 }
 
 function showCommandMessage(pi: ExtensionAPI, title: string, content: string) {

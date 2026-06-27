@@ -46,7 +46,11 @@ async function main() {
       },
     };
 
-    await manager.initialize(config);
+    await manager.initialize(config, {
+      mode: "connect",
+      intent: "explicit",
+      signal: undefined,
+    });
     assert.equal(manager.status().local?.status, "connected");
     assert.equal(manager.status().remote?.status, "connected");
 
@@ -98,25 +102,25 @@ async function main() {
       content: { name: "remote-user", count: 7, confirm: true, color: "green" },
     });
 
-    const resourceResult = await manager.resources();
+    const resourceResult = await manager.resources(undefined, { signal: undefined });
     assert.deepEqual(resourceResult.failures, []);
     assert.equal(resourceResult.resources.some((resource) => resource.client === "local" && resource.uri === "test://text"), true);
     assert.equal(resourceResult.resources.some((resource) => resource.client === "remote" && resource.uri === "test://image"), true);
 
-    const textResource = await manager.readResource("local", "test://text");
+    const textResource = await manager.readResource("local", "test://text", { signal: undefined });
     const formattedText = formatResourceContent("local", "test://text", textResource);
     assert.match(formattedText.text, /fixture resource text/);
 
-    const imageResource = await manager.readResource("local", "test://image");
+    const imageResource = await manager.readResource("local", "test://image", { signal: undefined });
     const formattedImage = formatResourceContent("local", "test://image", imageResource);
     assert.equal(formattedImage.images.length, 1);
 
-    const promptResult = await manager.prompts();
+    const promptResult = await manager.prompts({ signal: undefined });
     assert.deepEqual(promptResult.failures, []);
     const prompts = promptResult.prompts;
     assert.equal(prompts.some((prompt) => prompt.client === "local" && prompt.name === "review"), true);
 
-    const prompt = await manager.getPrompt("local", "review", { topic: "MCP" });
+    const prompt = await manager.getPrompt("local", "review", { topic: "MCP" }, { signal: undefined });
     assert.match(JSON.stringify(prompt.messages), /Review MCP from the fixture prompt/);
 
     await callTool(manager, "local_notify_tools_changed", {});

@@ -42,7 +42,11 @@ async function main() {
       },
     };
 
-    await manager.initialize(config);
+    await manager.initialize(config, {
+      mode: "connect",
+      intent: "explicit",
+      signal: undefined,
+    });
     assert.equal(manager.status().oauth?.status, "needs_auth");
     assert.equal(await manager.authStatus("oauth"), "not_authenticated");
 

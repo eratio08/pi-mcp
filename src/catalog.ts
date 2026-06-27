@@ -18,6 +18,7 @@ import {
 } from "./request-limits.js";
 import { base64Size, formatBytes } from "./resource-size.js";
 import { normalizeToolSchema } from "./tool-schema.js";
+import type { CancellableOptions } from "./types.js";
 
 const TolerantListToolsResultSchema = ListToolsResultSchema.extend({
   tools: ToolSchema.omit({ outputSchema: true }).array(),
@@ -50,7 +51,7 @@ export async function paginate<T, R extends { nextCursor?: string | undefined }>
 }
 
 /** Lists tools from an MCP client, with a compatibility path for unsupported output-schema references. */
-export async function listTools(client: Client, timeout = DEFAULT_TIMEOUT, signal?: AbortSignal): Promise<Tool[]> {
+export async function listTools(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Tool[]> {
   return paginate(
     async (cursor) => {
       const params = cursor === undefined ? undefined : { cursor };
@@ -66,7 +67,7 @@ export async function listTools(client: Client, timeout = DEFAULT_TIMEOUT, signa
 }
 
 /** Lists prompts from an MCP client when the server advertises prompt support. */
-export async function listPrompts(client: Client, timeout = DEFAULT_TIMEOUT, signal?: AbortSignal): Promise<Prompt[]> {
+export async function listPrompts(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Prompt[]> {
   if (!client.getServerCapabilities()?.prompts) return [];
   return paginate(
     (cursor) => client.listPrompts(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
@@ -75,7 +76,7 @@ export async function listPrompts(client: Client, timeout = DEFAULT_TIMEOUT, sig
 }
 
 /** Lists resources from an MCP client when the server advertises resource support. */
-export async function listResources(client: Client, timeout = DEFAULT_TIMEOUT, signal?: AbortSignal): Promise<Resource[]> {
+export async function listResources(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Resource[]> {
   if (!client.getServerCapabilities()?.resources) return [];
   return paginate(
     (cursor) => client.listResources(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
@@ -90,11 +91,11 @@ export function toolParameters(tool: Tool) {
 
 /** Calls one MCP tool and converts MCP content into Pi tool result content. */
 export async function callMcpTool(input: {
-  client: Client;
-  tool: Tool;
-  args: Record<string, unknown>;
-  timeout?: number;
-  signal?: AbortSignal;
+  readonly client: Client;
+  readonly tool: Tool;
+  readonly args: Record<string, unknown>;
+  readonly timeout?: number;
+  readonly signal: AbortSignal | undefined;
 }): Promise<AgentToolResult<Record<string, unknown>>> {
   const rawResult = await input.client.callTool(
     {
@@ -246,7 +247,7 @@ function isOutputSchemaValidationError(error: Error) {
   );
 }
 
-function requestOptions(timeout: number | undefined, signal: AbortSignal | undefined) {
+function requestOptions(timeout: number | undefined, signal: CancellableOptions["signal"]) {
   return {
     resetTimeoutOnProgress: true,
     timeout: timeout ?? DEFAULT_TIMEOUT,

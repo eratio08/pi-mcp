@@ -18,7 +18,17 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import open from "open";
-import type { AuthStatus, McpConfig, McpServerConfig, McpStatus, OAuthConfig } from "./types.js";
+import type {
+  AuthStatus,
+  CancellableOptions,
+  McpConfig,
+  McpConnectAllOptions,
+  McpConnectOptions,
+  McpInitializeOptions,
+  McpServerConfig,
+  McpStatus,
+  OAuthConfig,
+} from "./types.js";
 import { AuthStore } from "./auth-store.js";
 import { resolveHome } from "./config-values.js";
 import { redactSecrets } from "./display.js";
@@ -107,25 +117,85 @@ export class McpManager {
   private statuses = new Map<string, McpStatus>();
   private config: McpConfig = { servers: {} };
   private pendingOAuthTransports = new Map<string, TransportWithAuth>();
+  private manuallyDisconnected = new Set<string>();
+  private connectionAttempts = new Map<string, Promise<McpStatus>>();
+  private closed = false;
+  private revision = 0;
 
   /** Creates a manager for one Pi workspace and optional auth/UI callback seams. */
   constructor(private options: ManagerOptions) {
     this.auth = options.authStore ?? new AuthStore();
   }
 
-  /** Replaces the active MCP configuration and connects every enabled server. */
-  async initialize(config: McpConfig) {
+  /** Replaces the active MCP configuration and runs the caller-selected startup operation. */
+  async initialize(config: McpConfig, options: McpInitializeOptions): Promise<void> {
+    this.closed = false;
+    this.revision += 1;
     await this.closeClients();
+    this.connectionAttempts.clear();
     this.statuses.clear();
     this.config = cloneMcpConfig(config);
+
     for (const [name, serverConfig] of Object.entries(this.config.servers)) {
-      if (isDisabled(serverConfig)) {
-        this.statuses.set(name, { status: "disabled" });
-        continue;
-      }
-      await this.connect(name);
+      this.statuses.set(name, isConfigDisabled(serverConfig) ? { status: "disabled" } : { status: "disconnected" });
     }
+
+    if (options.mode === "connect") {
+      await this.connectAll({
+        intent: options.intent,
+        signal: options.signal,
+      });
+      return;
+    }
+
     await this.emitStatusChanged();
+  }
+
+  /** Connects every eligible configured MCP server in parallel and returns the latest status snapshot. */
+  async connectAll(options: McpConnectAllOptions): Promise<Record<string, McpStatus>> {
+    const targets = Object.entries(this.config.servers).filter(([name, serverConfig]) => {
+      const status = this.statuses.get(name);
+
+      if (options.intent === "automatic") {
+        return this.canAutoConnect(name, serverConfig, status);
+      }
+
+      return this.canExplicitConnect(serverConfig);
+    });
+
+    const settled = await Promise.allSettled(
+      targets.map(([name]) =>
+        this.connect(name, {
+          intent: options.intent,
+          signal: options.signal,
+        }),
+      ),
+    );
+
+    let hasUnhandledFailure = false;
+
+    for (let index = 0; index < settled.length; index++) {
+      const result = settled[index];
+      const target = targets[index];
+
+      if (!result || !target) continue;
+      if (result.status === "fulfilled") continue;
+
+      if (isAbortError(result.reason)) {
+        throw result.reason;
+      }
+
+      this.statuses.set(target[0], {
+        status: "failed",
+        error: errorMessage(result.reason),
+      });
+
+      hasUnhandledFailure = true;
+    }
+
+    if (hasUnhandledFailure) await this.emitStatusChanged();
+
+    return this.status();
   }
 
   /** Returns connection status for every configured MCP server. */
@@ -182,45 +252,62 @@ export class McpManager {
   }
 
   /** Connects or reconnects one configured MCP server. */
-  async connect(name: string) {
+  async connect(name: string, options: McpConnectOptions): Promise<McpStatus> {
     const serverConfig = this.config.servers[name];
     if (!serverConfig) throw new Error(`MCP server not found: ${name}`);
-    await this.disconnectClient(name, { status: "disabled" });
 
-    const result = serverConfig.type === "local" ? await this.connectLocal(name, serverConfig) : await this.connectRemote(name, serverConfig);
-    this.statuses.set(name, result.status);
+    const currentStatus = this.statuses.get(name);
 
-    if (result.client && result.transport) {
-      const tools = result.client.getServerCapabilities()?.tools
-        ? await listTools(result.client, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT)
-        : [];
-      const collision = findToolKeyCollision(new Map(this.clients).set(name, { client: result.client, transport: result.transport, config: serverConfig, tools }));
-      if (collision) {
-        const status = { status: "failed" as const, error: collision.message };
-        await safeCloseClient(result.client, result.transport);
-        this.statuses.set(name, status);
-        await this.emitStatusChanged();
-        return status;
+    if (options.intent === "automatic") {
+      if (!this.canAutoConnect(name, serverConfig, currentStatus)) {
+        return currentStatus ?? { status: "disabled" };
       }
-      this.clients.set(name, { client: result.client, transport: result.transport, config: serverConfig, tools });
-      this.watch(name, result.client, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT);
-      await this.options.onToolsChanged?.(name);
     }
 
-    await this.emitStatusChanged();
-    return result.status;
+    if (options.intent === "explicit") {
+      if (!this.canExplicitConnect(serverConfig)) {
+        const disabled = { status: "disabled" as const };
+        this.statuses.set(name, disabled);
+        return disabled;
+      }
+
+      this.manuallyDisconnected.delete(name);
+    }
+
+    options.signal?.throwIfAborted();
+
+    const existing = this.connectionAttempts.get(name);
+    if (existing) {
+      return waitForConnectAttempt(existing, options.signal);
+    }
+
+    const revision = this.revision;
+    const attempt = this.connectFresh(name, serverConfig, revision, {
+      signal: options.signal,
+    }).finally(() => {
+      if (this.connectionAttempts.get(name) === attempt) {
+        this.connectionAttempts.delete(name);
+      }
+    });
+
+    this.connectionAttempts.set(name, attempt);
+
+    return waitForConnectAttempt(attempt, options.signal);
   }
 
   /** Disconnects one configured MCP server for the current runtime. */
   async disconnect(name: string) {
     if (!this.config.servers[name]) throw new Error(`MCP server not found: ${name}`);
+
+    this.manuallyDisconnected.add(name);
+
     await this.disconnectClient(name, { status: "disabled" });
     await this.options.onToolsChanged?.(name);
     await this.emitStatusChanged();
   }
 
   /** Lists resources exposed by connected MCP servers, optionally restricted to one server. */
-  async resources(server?: string, options: { readonly signal?: AbortSignal } = {}): Promise<McpResourcesResult> {
+  async resources(server: string | undefined, options: CancellableOptions): Promise<McpResourcesResult> {
     const targets = Array.from(this.clients).filter(([name, managed]) => {
       if (server && name !== server) return false;
       return !!managed.client.getServerCapabilities()?.resources;
@@ -239,7 +326,7 @@ export class McpManager {
   }
 
   /** Lists prompts exposed by every connected MCP server. */
-  async prompts(options: { readonly signal?: AbortSignal } = {}): Promise<McpPromptsResult> {
+  async prompts(options: CancellableOptions): Promise<McpPromptsResult> {
     const targets = Array.from(this.clients).filter(([, managed]) => !!managed.client.getServerCapabilities()?.prompts);
     const collected = await collectPartial(targets, options.signal, async (name, managed) => {
       const prompts = await listPrompts(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal);
@@ -253,23 +340,23 @@ export class McpManager {
   }
 
   /** Fetches one prompt from a connected MCP server. */
-  async getPrompt(clientName: string, name: string, args?: Record<string, string>, options: { readonly signal?: AbortSignal } = {}) {
+  async getPrompt(clientName: string, name: string, args: Record<string, string> | undefined, options: CancellableOptions) {
     const managed = this.clients.get(clientName);
     if (!managed) throw new Error(`MCP server "${clientName}" is not connected`);
     return managed.client.getPrompt(
       { name, arguments: args },
-      { timeout: managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, ...(options.signal ? { signal: options.signal } : {}) },
+      sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal),
     );
   }
 
   /** Reads one resource from a connected MCP server. */
-  async readResource(clientName: string, uri: string, options: { readonly signal?: AbortSignal } = {}) {
+  async readResource(clientName: string, uri: string, options: CancellableOptions) {
     const managed = this.clients.get(clientName);
     if (!managed) throw new Error(`MCP server "${clientName}" is not connected`);
     if (!managed.client.getServerCapabilities()?.resources) throw new Error(`MCP server "${clientName}" does not support resources`);
     return managed.client.readResource(
       { uri },
-      { timeout: managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, ...(options.signal ? { signal: options.signal } : {}) },
+      sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal),
     );
   }
 
@@ -288,7 +375,7 @@ export class McpManager {
       if (!result.client) return { status: "failed", error: "OAuth did not return a connected client" } satisfies McpStatus;
       const serverConfig = this.requireRemote(name);
       const tools = result.client.getServerCapabilities()?.tools
-        ? await listTools(result.client, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT)
+        ? await listTools(result.client, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, undefined)
         : [];
       if (!result.transport) return { status: "failed", error: "OAuth did not return a connected transport" } satisfies McpStatus;
       await this.storeClient(name, result.client, result.transport, serverConfig, tools);
@@ -323,12 +410,116 @@ export class McpManager {
 
   /** Closes all connected MCP clients and any local OAuth callback listener. */
   async close() {
+    this.closed = true;
+    this.revision += 1;
     await this.closeClients();
     await stopCallbackServer();
     this.pendingOAuthTransports.clear();
+    this.connectionAttempts.clear();
   }
 
-  private async connectLocal(name: string, serverConfig: Extract<McpServerConfig, { type: "local" }>) {
+  private async connectFresh(
+    name: string,
+    serverConfig: McpServerConfig,
+    revision: number,
+    options: CancellableOptions,
+  ): Promise<McpStatus> {
+    options.signal?.throwIfAborted();
+
+    await this.disconnectClient(name, { status: "connecting" });
+
+    const result =
+      serverConfig.type === "local"
+        ? await this.connectLocal(name, serverConfig, options)
+        : await this.connectRemote(name, serverConfig, options);
+
+    if (options.signal?.aborted) {
+      if (result.client && result.transport) await safeCloseClient(result.client, result.transport);
+      options.signal.throwIfAborted();
+    }
+
+    if (!this.isCurrentRevision(revision)) {
+      if (result.client && result.transport) await safeCloseClient(result.client, result.transport);
+      return { status: "disconnected" };
+    }
+
+    if (this.manuallyDisconnected.has(name)) {
+      if (result.client && result.transport) await safeCloseClient(result.client, result.transport);
+      const disabled = { status: "disabled" as const };
+      this.statuses.set(name, disabled);
+      return disabled;
+    }
+
+    this.statuses.set(name, result.status);
+
+    if (!result.client || !result.transport) {
+      await this.options.onToolsChanged?.(name);
+      await this.emitStatusChanged();
+      return result.status;
+    }
+
+    let tools: Tool[];
+    try {
+      tools = result.client.getServerCapabilities()?.tools
+        ? await listTools(
+            result.client,
+            serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT,
+            options.signal,
+          )
+        : [];
+    } catch (error: unknown) {
+      await safeCloseClient(result.client, result.transport);
+      throw error;
+    }
+
+    if (options.signal?.aborted) {
+      await safeCloseClient(result.client, result.transport);
+      options.signal.throwIfAborted();
+    }
+
+    if (!this.isCurrentRevision(revision)) {
+      await safeCloseClient(result.client, result.transport);
+      return { status: "disconnected" };
+    }
+
+    if (this.manuallyDisconnected.has(name)) {
+      await safeCloseClient(result.client, result.transport);
+      const disabled = { status: "disabled" as const };
+      this.statuses.set(name, disabled);
+      return disabled;
+    }
+
+    const collision = findToolKeyCollision(
+      new Map(this.clients).set(name, {
+        client: result.client,
+        transport: result.transport,
+        config: serverConfig,
+        tools,
+      }),
+    );
+
+    if (collision) {
+      const status = { status: "failed" as const, error: collision.message };
+      await safeCloseClient(result.client, result.transport);
+      this.statuses.set(name, status);
+      await this.options.onToolsChanged?.(name);
+      await this.emitStatusChanged();
+      return status;
+    }
+
+    this.clients.set(name, {
+      client: result.client,
+      transport: result.transport,
+      config: serverConfig,
+      tools,
+    });
+    this.watch(name, result.client, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT);
+    await this.options.onToolsChanged?.(name);
+    await this.emitStatusChanged();
+    return result.status;
+  }
+
+  private async connectLocal(name: string, serverConfig: Extract<McpServerConfig, { type: "local" }>, options: CancellableOptions) {
     const [command, ...args] = serverConfig.command;
     if (!command) return { status: { status: "failed" as const, error: "Local MCP command is empty" } };
     const cwd = serverConfig.cwd ? path.resolve(this.options.cwd, resolveHome(serverConfig.cwd)) : this.options.cwd;
@@ -345,15 +536,21 @@ export class McpManager {
     });
 
     try {
-      const client = await this.connectTransport(name, transport, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT);
+      const client = await this.connectTransport(
+        name,
+        transport,
+        serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT,
+        options,
+      );
       return { client, transport, status: { status: "connected" as const } };
-    } catch (error) {
+    } catch (error: unknown) {
       await safeCloseTransport(transport);
+      if (isAbortError(error)) throw error;
       return { status: { status: "failed" as const, error: errorMessage(error) } };
     }
   }
 
-  private async connectRemote(name: string, serverConfig: Extract<McpServerConfig, { type: "remote" }>) {
+  private async connectRemote(name: string, serverConfig: Extract<McpServerConfig, { type: "remote" }>, options: CancellableOptions) {
     const url = URL.canParse(serverConfig.url) ? new URL(serverConfig.url) : undefined;
     if (!url) return { status: { status: "failed" as const, error: `Invalid MCP URL for "${name}"` } };
 
@@ -382,9 +579,19 @@ export class McpManager {
     let lastStatus: McpStatus | undefined;
     for (const candidate of transports) {
       try {
-        const client = await this.connectTransport(name, candidate.transport, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT);
+        const client = await this.connectTransport(
+          name,
+          candidate.transport,
+          serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT,
+          options,
+        );
         return { client, transport: candidate.transport, status: { status: "connected" as const } };
-      } catch (error) {
+      } catch (error: unknown) {
+        if (isAbortError(error)) {
+          await safeCloseTransport(candidate.transport);
+          throw error;
+        }
+
         const message = errorMessage(error);
         const isAuthError = error instanceof UnauthorizedError || (!!authProvider && /oauth|authorization|unauthorized/i.test(message));
         if (isAuthError) {
@@ -408,9 +615,11 @@ export class McpManager {
     return { status: lastStatus ?? { status: "failed", error: "Unknown MCP connection error" } };
   }
 
-  private async connectTransport(name: string, transport: Transport, timeout: number) {
+  private async connectTransport(name: string, transport: Transport, timeout: number, options: CancellableOptions) {
+    options.signal?.throwIfAborted();
+
     const client = this.createClient(name);
-    await withTimeout(client.connect(asSdkTransport(transport)), timeout, "MCP connect");
+    await withTimeout(client.connect(asSdkTransport(transport)), timeout, "MCP connect", { signal: undefined });
     return client;
   }
 
@@ -449,7 +658,7 @@ export class McpManager {
   private async handleToolListChanged(name: string, client: Client, timeout: number) {
     const managed = this.clients.get(name);
     if (!managed || managed.client !== client || this.statuses.get(name)?.status !== "connected") return;
-    const tools = await listTools(client, timeout);
+    const tools = await listTools(client, timeout, undefined);
     const collision = findToolKeyCollision(new Map(this.clients).set(name, { ...managed, tools }));
     if (collision) {
       this.clients.delete(name);
@@ -514,7 +723,7 @@ export class McpManager {
       const exchangedEntry = await this.auth.get(name);
       await this.auth.clearCodeVerifier(name);
       this.pendingOAuthTransports.delete(name);
-      const status = await this.connect(name);
+      const status = await this.connect(name, { intent: "explicit", signal: undefined });
       if (status.status === "needs_auth" && exchangedEntry?.tokens) {
         return {
           status: "failed",
@@ -577,6 +786,21 @@ export class McpManager {
     await this.options.onStatusChanged?.();
   }
 
+  private isCurrentRevision(revision: number) {
+    return !this.closed && this.revision === revision;
+  }
+
+  private canAutoConnect(name: string, config: McpServerConfig, status: McpStatus | undefined): boolean {
+    if (isConfigDisabled(config)) return false;
+    if (this.manuallyDisconnected.has(name)) return false;
+
+    return status === undefined || status.status === "disconnected" || status.status === "connecting";
+  }
+
+  private canExplicitConnect(config: McpServerConfig): boolean {
+    return !isConfigDisabled(config);
+  }
+
   private async openAuthorizationUrl(url: string, onAuthorizationUrl?: (url: string) => void | Promise<void>) {
     if (this.options.openAuthorizationUrl) {
       await this.options.openAuthorizationUrl(url);
@@ -604,7 +828,7 @@ export class McpManager {
   }
 }
 
-function isDisabled(config: McpServerConfig) {
+function isConfigDisabled(config: McpServerConfig) {
   return config.enabled === false || config.disabled === true;
 }
 
@@ -639,6 +863,8 @@ function cloneMcpConfig(config: McpConfig): McpConfig {
     servers,
     ...(config.timeout !== undefined ? { timeout: config.timeout } : {}),
     ...(config.source !== undefined ? { source: config.source } : {}),
+    ...(config.toolMode !== undefined ? { toolMode: config.toolMode } : {}),
+    ...(config.startup !== undefined ? { startup: config.startup } : {}),
   };
 }
 
@@ -685,6 +911,10 @@ function cloneStatus(status: McpStatus): McpStatus {
   switch (status.status) {
     case "connected":
       return { status: "connected" };
+    case "connecting":
+      return { status: "connecting" };
+    case "disconnected":
+      return { status: "disconnected" };
     case "disabled":
       return { status: "disabled" };
     case "needs_auth":
@@ -711,6 +941,37 @@ function findToolKeyCollision(clients: ReadonlyMap<string, ManagedClient>) {
     }
   }
   return undefined;
+}
+
+async function waitForConnectAttempt(attempt: Promise<McpStatus>, signal: AbortSignal | undefined): Promise<McpStatus> {
+  signal?.throwIfAborted();
+
+  if (!signal) return attempt;
+
+  let abortHandler: (() => void) | undefined;
+
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    abortHandler = () => {
+      reject(new DOMException("MCP connect aborted", "AbortError"));
+    };
+
+    signal.addEventListener("abort", abortHandler, { once: true });
+  });
+
+  try {
+    return await Promise.race([attempt, abortPromise]);
+  } finally {
+    if (abortHandler) {
+      signal.removeEventListener("abort", abortHandler);
+    }
+  }
+}
+
+function sdkRequestOptions(timeout: number, signal: AbortSignal | undefined) {
+  return {
+    timeout,
+    ...(signal ? { signal } : {}),
+  };
 }
 
 async function collectPartial<T>(

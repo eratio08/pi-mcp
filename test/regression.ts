@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AuthStore } from "../src/auth-store.js";
@@ -13,6 +13,7 @@ import { root } from "./helpers.js";
 async function main() {
   await rejectsInvalidServerConfig();
   await loadsProxyToolMode();
+  await loadsStartupMode();
   await rejectsMissingEnvironmentPlaceholder();
   redactsDisplayTargets();
   await rejectsMalformedAuthStoreData();
@@ -20,6 +21,12 @@ async function main() {
   await rejectsUnavailableOAuthCallbackPort();
   await handlesClientCloseCallbackRejections();
   await rejectsDynamicToolKeyCollisions();
+  await configuresWithoutConnecting();
+  await automaticConnectSkipsConfigDisabledServers();
+  await explicitConnectSkipsConfigDisabledServers();
+  await explicitConnectClearsRuntimeDisconnect();
+  await concurrentConnectsShareOneInFlightAttempt();
+  await connectPropagatesCancellation();
   await returnsImmutableManagerSnapshots();
   await propagatesListCancellation();
   console.log("regression ok");
@@ -61,6 +68,26 @@ async function loadsProxyToolMode() {
   assert.equal(config.toolMode, "proxy");
   assert.equal(config.servers.local?.type, "local");
   assert.deepEqual(config.servers.local.type === "local" ? config.servers.local.command : [], ["fixture-server"]);
+}
+
+async function loadsStartupMode() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-startup-config-"));
+  await writeFile(
+    path.join(dir, "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        startup: "eager",
+        local: {
+          type: "local",
+          command: ["fixture-server"],
+        },
+      },
+    }),
+  );
+
+  const config = await loadMcpConfig({ cwd: dir });
+  assert.equal(config.startup, "eager");
+  assert.equal(config.servers.local?.type, "local");
 }
 
 async function rejectsMissingEnvironmentPlaceholder() {
@@ -197,7 +224,11 @@ async function rejectsUnavailableOAuthCallbackPort() {
   });
 
   try {
-    await manager.initialize(config);
+    await manager.initialize(config, {
+      mode: "connect",
+      intent: "explicit",
+      signal: undefined,
+    });
     await assert.rejects(() => manager.authenticate("oauth"), /OAuth callback server could not listen/);
   } finally {
     await manager.close();
@@ -225,15 +256,22 @@ async function handlesClientCloseCallbackRejections() {
   });
 
   try {
-    await manager.initialize({
-      servers: {
-        local: {
-          type: "local",
-          command: [process.execPath, "test/local-mcp-server.mjs"],
-          timeout: 10_000,
+    await manager.initialize(
+      {
+        servers: {
+          local: {
+            type: "local",
+            command: [process.execPath, "test/local-mcp-server.mjs"],
+            timeout: 10_000,
+          },
         },
       },
-    });
+      {
+        mode: "connect",
+        intent: "explicit",
+        signal: undefined,
+      },
+    );
 
     const connected = Array.from(manager.connectedClients().values());
     assert.equal(connected.length, 1);
@@ -260,25 +298,245 @@ async function handlesClientCloseCallbackRejections() {
 async function rejectsDynamicToolKeyCollisions() {
   const manager = new McpManager({ cwd: root });
   try {
-    await manager.initialize({
-      servers: {
-        "a.b": {
-          type: "local",
-          command: [process.execPath, "test/local-mcp-server.mjs"],
-          timeout: 10_000,
-        },
-        a_b: {
-          type: "local",
-          command: [process.execPath, "test/local-mcp-server.mjs"],
-          timeout: 10_000,
+    await manager.initialize(
+      {
+        servers: {
+          "a.b": {
+            type: "local",
+            command: [process.execPath, "test/local-mcp-server.mjs"],
+            timeout: 10_000,
+          },
+          a_b: {
+            type: "local",
+            command: [process.execPath, "test/local-mcp-server.mjs"],
+            timeout: 10_000,
+          },
         },
       },
-    });
+      {
+        mode: "connect",
+        intent: "explicit",
+        signal: undefined,
+      },
+    );
     const statuses = manager.status();
-    assert.equal(statuses["a.b"]?.status, "connected");
-    assert.equal(statuses.a_b?.status, "failed");
-    assert.match(statuses.a_b?.status === "failed" ? statuses.a_b.error : "", /tool name collision/);
+    const finalStatuses = [statuses["a.b"], statuses.a_b];
+    assert.equal(finalStatuses.filter((status) => status?.status === "connected").length, 1);
+    assert.equal(finalStatuses.filter((status) => status?.status === "failed").length, 1);
+    assert.equal(
+      finalStatuses.some((status) => status?.status === "failed" && /tool name collision/.test(status.error)),
+      true,
+    );
     assert.equal(manager.getToolEntries().filter((entry) => entry.key === "a_b_echo").length, 1);
+  } finally {
+    await manager.close();
+  }
+}
+
+async function configuresWithoutConnecting() {
+  const manager = new McpManager({ cwd: root });
+  try {
+    await manager.initialize(
+      {
+        servers: {
+          local: {
+            type: "local",
+            command: [process.execPath, "test/local-mcp-server.mjs"],
+            timeout: 10_000,
+          },
+        },
+      },
+      { mode: "configure-only" },
+    );
+    assert.equal(manager.status().local?.status, "disconnected");
+    assert.deepEqual(manager.getToolEntries(), []);
+
+    await manager.connectAll({
+      intent: "explicit",
+      signal: undefined,
+    });
+    assert.equal(manager.status().local?.status, "connected");
+    assert.equal(manager.getToolEntries().some((entry) => entry.key === "local_echo"), true);
+  } finally {
+    await manager.close();
+  }
+}
+
+async function automaticConnectSkipsConfigDisabledServers() {
+  const manager = new McpManager({ cwd: root });
+
+  try {
+    await manager.initialize(
+      {
+        servers: {
+          off: {
+            type: "local",
+            command: [process.execPath, "test/local-mcp-server.mjs"],
+            disabled: true,
+            timeout: 10_000,
+          },
+        },
+      },
+      { mode: "configure-only" },
+    );
+
+    const status = await manager.connect("off", {
+      intent: "automatic",
+      signal: undefined,
+    });
+
+    assert.equal(status.status, "disabled");
+    assert.equal(manager.status().off?.status, "disabled");
+    assert.deepEqual(manager.getToolEntries(), []);
+  } finally {
+    await manager.close();
+  }
+}
+
+async function explicitConnectSkipsConfigDisabledServers() {
+  const manager = new McpManager({ cwd: root });
+
+  try {
+    await manager.initialize(
+      {
+        servers: {
+          off: {
+            type: "local",
+            command: [process.execPath, "test/local-mcp-server.mjs"],
+            disabled: true,
+            timeout: 10_000,
+          },
+        },
+      },
+      { mode: "configure-only" },
+    );
+
+    const status = await manager.connect("off", {
+      intent: "explicit",
+      signal: undefined,
+    });
+
+    assert.equal(status.status, "disabled");
+    assert.equal(manager.status().off?.status, "disabled");
+    assert.deepEqual(manager.getToolEntries(), []);
+  } finally {
+    await manager.close();
+  }
+}
+
+async function explicitConnectClearsRuntimeDisconnect() {
+  const manager = new McpManager({ cwd: root });
+
+  try {
+    await manager.initialize(
+      {
+        servers: {
+          local: {
+            type: "local",
+            command: [process.execPath, "test/local-mcp-server.mjs"],
+            timeout: 10_000,
+          },
+        },
+      },
+      {
+        mode: "connect",
+        intent: "explicit",
+        signal: undefined,
+      },
+    );
+
+    await manager.disconnect("local");
+
+    assert.equal(manager.status().local?.status, "disabled");
+
+    const automaticStatus = await manager.connect("local", {
+      intent: "automatic",
+      signal: undefined,
+    });
+
+    assert.equal(automaticStatus.status, "disabled");
+
+    const explicitStatus = await manager.connect("local", {
+      intent: "explicit",
+      signal: undefined,
+    });
+
+    assert.equal(explicitStatus.status, "connected");
+    assert.equal(manager.getToolEntries().some((entry) => entry.key === "local_echo"), true);
+  } finally {
+    await manager.close();
+  }
+}
+
+async function concurrentConnectsShareOneInFlightAttempt() {
+  const startsDir = await mkdtemp(path.join(tmpdir(), "pi-mcp-starts-"));
+  const startsFile = path.join(startsDir, "starts.txt");
+  const script = await writeDelayedRecordingFixtureScript(startsFile, 300);
+  const manager = new McpManager({ cwd: root });
+
+  try {
+    await manager.initialize(
+      {
+        servers: {
+          slow: {
+            type: "local",
+            command: [process.execPath, script],
+            timeout: 10_000,
+          },
+        },
+      },
+      { mode: "configure-only" },
+    );
+
+    const first = manager.connect("slow", {
+      intent: "automatic",
+      signal: undefined,
+    });
+
+    const second = manager.connect("slow", {
+      intent: "automatic",
+      signal: undefined,
+    });
+
+    const [firstStatus, secondStatus] = await Promise.all([first, second]);
+
+    assert.equal(firstStatus.status, "connected");
+    assert.equal(secondStatus.status, "connected");
+    assert.equal(await readStartCount(startsFile), 1);
+  } finally {
+    await manager.close();
+  }
+}
+
+async function connectPropagatesCancellation() {
+  const startsDir = await mkdtemp(path.join(tmpdir(), "pi-mcp-starts-"));
+  const startsFile = path.join(startsDir, "starts.txt");
+  const script = await writeDelayedRecordingFixtureScript(startsFile, 300);
+  const controller = new AbortController();
+  const manager = new McpManager({ cwd: root });
+
+  try {
+    await manager.initialize(
+      {
+        servers: {
+          slow: {
+            type: "local",
+            command: [process.execPath, script],
+            timeout: 10_000,
+          },
+        },
+      },
+      { mode: "configure-only" },
+    );
+
+    const pending = manager.connect("slow", {
+      intent: "automatic",
+      signal: controller.signal,
+    });
+
+    controller.abort();
+
+    await assert.rejects(() => pending, { name: "AbortError" });
   } finally {
     await manager.close();
   }
@@ -293,7 +551,7 @@ async function returnsImmutableManagerSnapshots() {
     },
   };
   const manager = new McpManager({ cwd: root });
-  await manager.initialize({ servers });
+  await manager.initialize({ servers }, { mode: "configure-only" });
 
   servers.b = {
     type: "remote",
@@ -334,6 +592,36 @@ async function listenOnFreePort() {
     port: address.port,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
+}
+
+async function writeDelayedRecordingFixtureScript(startsFile: string, delayMs: number) {
+  const script = path.join(await mkdtemp(path.join(tmpdir(), "pi-mcp-delayed-fixture-")), "fixture.mjs");
+  await writeFile(
+    script,
+    `import { appendFile } from "node:fs/promises";\n` +
+      `import { createRequire } from "node:module";\n` +
+      `import { setTimeout as sleep } from "node:timers/promises";\n` +
+      `import { pathToFileURL } from "node:url";\n` +
+      `const require = createRequire(${JSON.stringify(path.join(root, "package.json"))});\n` +
+      `const { McpServer } = await import(pathToFileURL(require.resolve("@modelcontextprotocol/sdk/server/mcp.js")).href);\n` +
+      `const { StdioServerTransport } = await import(pathToFileURL(require.resolve("@modelcontextprotocol/sdk/server/stdio.js")).href);\n` +
+      `const z = await import(pathToFileURL(require.resolve("zod/v4")).href);\n` +
+      `await appendFile(${JSON.stringify(startsFile)}, "1\\n");\n` +
+      `await sleep(${JSON.stringify(delayMs)});\n` +
+      `const server = new McpServer({ name: "pi-mcp-delayed-fixture", version: "1.0.0" });\n` +
+      `server.registerTool("echo", { title: "Echo", inputSchema: { message: z.string().optional() } }, async ({ message }) => ({ content: [{ type: "text", text: String(message ?? "") }] }));\n` +
+      `await server.connect(new StdioServerTransport());\n`,
+  );
+  return script;
+}
+
+async function readStartCount(startsFile: string) {
+  try {
+    return (await readFile(startsFile, "utf8")).trim().split("\n").filter(Boolean).length;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return 0;
+    throw error;
+  }
 }
 
 function sleep(ms: number) {
