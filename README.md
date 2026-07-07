@@ -18,12 +18,19 @@ pi -e /Users/dmmulroy/Documents/pi-mcp
 
 ## Configuration
 
-The extension reads OpenCode-compatible MCP config from, in order:
+The extension builds one effective MCP config with last-wins merge semantics.
 
-1. `PI_MCP_CONFIG` as a JSON string or path to a JSON/JSONC file
-2. `.pi/mcp.json` or `.pi/mcp.jsonc`
-3. `opencode.json`, `opencode.jsonc`, `.opencode/opencode.json`, `.opencode/opencode.jsonc`
-4. `~/.pi/agent/mcp.json` or `~/.pi/agent/mcp.jsonc`
+Sources load from lowest to highest precedence:
+
+1. `~/.pi/agent/mcp.json` or `~/.pi/agent/mcp.jsonc`
+2. `opencode.json`, then `opencode.jsonc`, from ancestor directories root to leaf
+3. `.opencode/opencode.json`, then `.opencode/opencode.jsonc`, from ancestor directories root to leaf
+4. `.pi/mcp.json`, then `.pi/mcp.jsonc`, from ancestor directories root to leaf
+5. `PI_MCP_CONFIG` as a JSON string or path to a JSON/JSONC file
+
+Later sources override earlier ones.
+Server entries merge by name.
+If later layer changes server `type`, later server replaces earlier server.
 
 Supported flat OpenCode shape:
 

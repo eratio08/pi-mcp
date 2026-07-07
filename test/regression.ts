@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AuthStore } from "../src/auth-store.js";
@@ -15,6 +15,10 @@ async function main() {
   await rejectsInvalidServerConfig();
   await loadsProxyToolMode();
   await loadsStartupMode();
+  await mergesAncestorProjectFiles();
+  await mergesDotDirectoriesByPrecedence();
+  await mergesGlobalWithLocalOverride();
+  await mergesEnvOverrideLast();
   await rejectsMissingEnvironmentPlaceholder();
   redactsDisplayTargets();
   await rejectsMalformedAuthStoreData();
@@ -137,6 +141,179 @@ async function loadsStartupMode() {
   const config = await loadMcpConfig({ cwd: dir });
   assert.equal(config.startup, "eager");
   assert.equal(config.servers.local?.type, "local");
+}
+
+async function mergesAncestorProjectFiles() {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-mcp-ancestor-config-"));
+  const child = path.join(root, "apps", "web");
+  await mkdir(child, { recursive: true });
+  await writeFile(
+    path.join(root, "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        timeout: 1000,
+        shared: {
+          type: "local",
+          command: ["root-server"],
+        },
+      },
+    }),
+  );
+  await writeFile(
+    path.join(child, "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        timeout: 2000,
+        startup: "lazy",
+        shared: {
+          type: "local",
+          command: ["child-server"],
+        },
+        extra: {
+          type: "remote",
+          url: "https://example.test/mcp",
+        },
+      },
+    }),
+  );
+
+  const config = await loadMcpConfig({ cwd: child });
+  assert.equal(config.timeout, 2000);
+  assert.equal(config.startup, "lazy");
+  assert.equal(config.servers.shared?.type, "local");
+  assert.deepEqual(config.servers.shared?.type === "local" ? config.servers.shared.command : [], ["child-server"]);
+  assert.equal(config.servers.shared?.timeout, 2000);
+  assert.equal(config.servers.extra?.type, "remote");
+}
+
+async function mergesDotDirectoriesByPrecedence() {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-mcp-dot-config-"));
+  const child = path.join(root, "apps", "web");
+  await mkdir(path.join(child, ".opencode"), { recursive: true });
+  await mkdir(path.join(child, ".pi"), { recursive: true });
+  await writeFile(
+    path.join(root, "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        shared: {
+          type: "local",
+          command: ["project-server"],
+        },
+      },
+    }),
+  );
+  await writeFile(
+    path.join(child, ".opencode", "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        shared: {
+          type: "local",
+          command: ["dot-opencode-server"],
+        },
+      },
+    }),
+  );
+  await writeFile(
+    path.join(child, ".pi", "mcp.json"),
+    JSON.stringify({
+      mcp: {
+        shared: {
+          type: "local",
+          command: ["dot-pi-server"],
+        },
+      },
+    }),
+  );
+
+  const config = await loadMcpConfig({ cwd: child });
+  assert.equal(config.servers.shared?.type, "local");
+  assert.deepEqual(config.servers.shared?.type === "local" ? config.servers.shared.command : [], ["dot-pi-server"]);
+}
+
+async function mergesGlobalWithLocalOverride() {
+  const home = await mkdtemp(path.join(tmpdir(), "pi-mcp-home-"));
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-local-"));
+  await mkdir(path.join(home, ".pi", "agent"), { recursive: true });
+  await writeFile(
+    path.join(home, ".pi", "agent", "mcp.json"),
+    JSON.stringify({
+      mcp: {
+        shared: {
+          type: "local",
+          command: ["global-server"],
+        },
+        globalOnly: {
+          type: "remote",
+          url: "https://global.example.test/mcp",
+        },
+      },
+    }),
+  );
+  await writeFile(
+    path.join(dir, "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        shared: {
+          type: "local",
+          command: ["local-server"],
+        },
+      },
+    }),
+  );
+
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const config = await loadMcpConfig({ cwd: dir });
+    assert.equal(config.servers.shared?.type, "local");
+    assert.deepEqual(config.servers.shared?.type === "local" ? config.servers.shared.command : [], ["local-server"]);
+    assert.equal(config.servers.globalOnly?.type, "remote");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+  }
+}
+
+async function mergesEnvOverrideLast() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-env-override-"));
+  await writeFile(
+    path.join(dir, "opencode.json"),
+    JSON.stringify({
+      mcp: {
+        toolMode: "direct",
+        shared: {
+          type: "local",
+          command: ["file-server"],
+        },
+      },
+    }),
+  );
+
+  const previous = process.env.PI_MCP_CONFIG;
+  process.env.PI_MCP_CONFIG = JSON.stringify({
+    mcp: {
+      toolMode: "proxy",
+      shared: {
+        type: "local",
+        command: ["env-server"],
+      },
+      envOnly: {
+        type: "remote",
+        url: "https://env.example.test/mcp",
+      },
+    },
+  });
+
+  try {
+    const config = await loadMcpConfig({ cwd: dir });
+    assert.equal(config.toolMode, "proxy");
+    assert.equal(config.servers.shared?.type, "local");
+    assert.deepEqual(config.servers.shared?.type === "local" ? config.servers.shared.command : [], ["env-server"]);
+    assert.equal(config.servers.envOnly?.type, "remote");
+  } finally {
+    if (previous === undefined) delete process.env.PI_MCP_CONFIG;
+    else process.env.PI_MCP_CONFIG = previous;
+  }
 }
 
 async function rejectsMissingEnvironmentPlaceholder() {
