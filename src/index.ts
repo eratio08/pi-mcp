@@ -31,6 +31,11 @@ interface RenderResultOptions {
   isPartial: boolean;
 }
 
+interface RenderCallContext {
+  expanded: boolean;
+  isError: boolean;
+}
+
 interface RenderResultContext {
   isError: boolean;
   showImages: boolean;
@@ -144,7 +149,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         promptGuidelines: [`Use ${entry.key} only when the user needs the ${entry.name} MCP tool from server ${entry.server}.`],
         parameters: typeboxToolParameters(entry.tool),
         renderCall(args, theme, context) {
-          return renderToolCall(entry.key, args, theme, context.expanded);
+          return renderToolCall(entry.key, args, theme, context);
         },
         renderResult(result, options, theme, context) {
           return renderToolResult("generic", result as RenderableToolResult, options, theme, context);
@@ -190,7 +195,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       ],
       parameters: McpProxyParams,
       renderCall(args, theme, context) {
-        return renderMcpProxyCall(args, theme, context.expanded);
+        return renderMcpProxyCall(args, theme, context);
       },
       renderResult(result, options, theme, context) {
         return renderToolResult("proxy", result as RenderableToolResult, options, theme, context);
@@ -477,7 +482,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       ],
       parameters: ListResourcesParams,
       renderCall(args, theme, context) {
-        return renderToolCall(LIST_MCP_RESOURCES_TOOL, args, theme, context.expanded);
+        return renderToolCall(LIST_MCP_RESOURCES_TOOL, args, theme, context);
       },
       renderResult(result, options, theme, context) {
         return renderToolResult("list-resources", result as RenderableToolResult, options, theme, context);
@@ -522,7 +527,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       ],
       parameters: ReadResourceParams,
       renderCall(args, theme, context) {
-        return renderToolCall(READ_MCP_RESOURCE_TOOL, args, theme, context.expanded);
+        return renderToolCall(READ_MCP_RESOURCE_TOOL, args, theme, context);
       },
       renderResult(result, options, theme, context) {
         return renderToolResult("read-resource", result as RenderableToolResult, options, theme, context);
@@ -931,15 +936,19 @@ function colorizeToolOutput(value: string, theme: RenderTheme, isError: boolean)
   return value.split("\n").map((line) => theme.fg(color, line)).join("\n");
 }
 
-function renderMcpProxyCall(args: unknown, theme: RenderTheme, expanded: boolean) {
-  return renderToolCall(MCP_PROXY_TOOL, args, theme, expanded);
+function renderMcpProxyCall(args: unknown, theme: RenderTheme, context: RenderCallContext) {
+  return renderToolCall(MCP_PROXY_TOOL, args, theme, context);
 }
 
-function renderToolCall(name: string, args: unknown, theme: RenderTheme, expanded: boolean) {
-  const title = theme.fg("toolTitle", theme.bold(name));
-  const renderedArgs = formatRenderedCallArgs(args, expanded);
+function renderToolCall(name: string, args: unknown, theme: RenderTheme, context: RenderCallContext) {
+  const color = context.isError ? "error" : "toolTitle";
+  const detailColor = context.isError ? "error" : "muted";
+  const title = theme.fg(color, theme.bold(name));
+  const renderedArgs = formatRenderedCallArgs(args, context.expanded);
   if (!renderedArgs) return new Text(title, 0, 0);
-  return expanded ? new Text(`${title}\n${theme.fg("muted", renderedArgs)}`, 0, 0) : new Text(`${title} ${theme.fg("muted", renderedArgs)}`, 0, 0);
+  return context.expanded
+    ? new Text(`${title}\n${theme.fg(detailColor, renderedArgs)}`, 0, 0)
+    : new Text(`${title} ${theme.fg(detailColor, renderedArgs)}`, 0, 0);
 }
 
 function formatRenderedCallArgs(args: unknown, expanded: boolean) {
