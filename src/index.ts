@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, Image, Text } from "@earendil-works/pi-tui";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { TSchema } from "typebox";
 import { Type } from "typebox";
@@ -19,8 +19,26 @@ const MAX_RENDERED_CALL_ARGS_CHARS = 1500;
 const MAX_PROXY_SEARCH_RESULTS = 30;
 
 interface RenderTheme {
-  fg: (name: "toolTitle" | "muted", text: string) => string;
+  fg: (
+    name: "accent" | "dim" | "error" | "muted" | "success" | "toolOutput" | "toolTitle" | "warning",
+    text: string,
+  ) => string;
   bold: (text: string) => string;
+}
+
+interface RenderResultOptions {
+  expanded: boolean;
+  isPartial: boolean;
+}
+
+interface RenderResultContext {
+  isError: boolean;
+  showImages: boolean;
+}
+
+interface RenderableToolResult {
+  content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }>;
+  details?: unknown;
 }
 
 const ListResourcesParams = Type.Object({
@@ -125,8 +143,11 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         promptSnippet: `Call MCP tool ${entry.name} on server ${entry.server}`,
         promptGuidelines: [`Use ${entry.key} only when the user needs the ${entry.name} MCP tool from server ${entry.server}.`],
         parameters: typeboxToolParameters(entry.tool),
-        renderCall(args, theme) {
-          return renderToolCall(entry.key, args, theme);
+        renderCall(args, theme, context) {
+          return renderToolCall(entry.key, args, theme, context.expanded);
+        },
+        renderResult(result, options, theme, context) {
+          return renderToolResult("generic", result as RenderableToolResult, options, theme, context);
         },
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
           const latest = requireManager().getToolEntry(entry.key);
@@ -168,8 +189,11 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         "Call native Pi tools such as read, bash, edit, and write directly; do not route them through mcp.",
       ],
       parameters: McpProxyParams,
-      renderCall(args, theme) {
-        return renderMcpProxyCall(args, theme);
+      renderCall(args, theme, context) {
+        return renderMcpProxyCall(args, theme, context.expanded);
+      },
+      renderResult(result, options, theme, context) {
+        return renderToolResult("proxy", result as RenderableToolResult, options, theme, context);
       },
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         latestContext = ctx ?? latestContext;
@@ -452,8 +476,11 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         "Use list_mcp_resources before read_mcp_resource when the user asks about available MCP resources or does not provide an exact MCP URI.",
       ],
       parameters: ListResourcesParams,
-      renderCall(args, theme) {
-        return renderToolCall(LIST_MCP_RESOURCES_TOOL, args, theme);
+      renderCall(args, theme, context) {
+        return renderToolCall(LIST_MCP_RESOURCES_TOOL, args, theme, context.expanded);
+      },
+      renderResult(result, options, theme, context) {
+        return renderToolResult("list-resources", result as RenderableToolResult, options, theme, context);
       },
       async execute(_toolCallId, params, signal) {
         const parsed = parseListResourcesArgs(params);
@@ -494,8 +521,11 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         "Use read_mcp_resource only with an exact MCP server name and URI returned by list_mcp_resources or supplied by the user.",
       ],
       parameters: ReadResourceParams,
-      renderCall(args, theme) {
-        return renderToolCall(READ_MCP_RESOURCE_TOOL, args, theme);
+      renderCall(args, theme, context) {
+        return renderToolCall(READ_MCP_RESOURCE_TOOL, args, theme, context.expanded);
+      },
+      renderResult(result, options, theme, context) {
+        return renderToolResult("read-resource", result as RenderableToolResult, options, theme, context);
       },
       async execute(_toolCallId, params, signal) {
         const parsed = parseReadResourceArgs(params);
@@ -847,37 +877,89 @@ function typeboxToolParameters(tool: Tool): TSchema {
   return parameters as TSchema;
 }
 
-function renderMcpProxyCall(args: unknown, theme: RenderTheme) {
-  if (!isPlainRecord(args)) return renderToolCall(MCP_PROXY_TOOL, args, theme);
-  const title = theme.fg("toolTitle", theme.bold(formatMcpProxyCallTitle(args)));
-  const rawArgs = typeof args.args === "string" ? args.args : undefined;
-  if (!rawArgs) return new Text(title, 0, 0);
-  return new Text(`${title}\n${theme.fg("muted", formatJsonish(rawArgs))}`, 0, 0);
+
+function renderToolResult(
+  _kind: "generic" | "proxy" | "list-resources" | "read-resource",
+  result: RenderableToolResult,
+  { expanded, isPartial }: RenderResultOptions,
+  theme: RenderTheme,
+  context: RenderResultContext,
+) {
+  if (!expanded) return new Text("", 0, 0);
+  if (isPartial) return new Text(theme.fg("warning", "Working..."), 0, 0);
+
+  const fullText = extractToolText(result.content);
+  const images = result.content.filter((item) => item.type === "image");
+  if (!fullText.trim() && images.length === 0) {
+    return new Text(theme.fg(context.isError ? "error" : "muted", context.isError ? "error" : "done"), 0, 0);
+  }
+
+  const container = new Container();
+  if (fullText.trim()) {
+    container.addChild(new Text(colorizeToolOutput(fullText, theme, context.isError), 0, 0));
+  }
+  if (images.length > 0) {
+    if (context.showImages) {
+      for (const image of images) {
+        container.addChild(
+          new Image(
+            image.data,
+            image.mimeType,
+            { fallbackColor: (text) => theme.fg("muted", text) },
+            { maxWidthCells: 80, maxHeightCells: 24 },
+          ),
+        );
+      }
+    } else {
+      container.addChild(
+        new Text(theme.fg("dim", `${images.length} image${images.length === 1 ? "" : "s"} hidden by terminal.showImages=false`), 0, 0),
+      );
+    }
+  }
+  return container;
 }
 
-function formatMcpProxyCallTitle(args: Record<string, unknown>) {
-  if (typeof args.tool === "string") return args.server ? `mcp call ${args.tool} @ ${args.server}` : `mcp call ${args.tool}`;
-  if (typeof args.connect === "string") return `mcp connect ${args.connect}`;
-  if (typeof args.describe === "string") return args.server ? `mcp describe ${args.describe} @ ${args.server}` : `mcp describe ${args.describe}`;
-  if (typeof args.search === "string") return args.server ? `mcp search ${args.search} @ ${args.server}` : `mcp search ${args.search}`;
-  if (typeof args.server === "string") return `mcp list ${args.server}`;
-  if (typeof args.action === "string") return `mcp ${args.action}`;
-  return "mcp status";
+function extractToolText(content: RenderableToolResult["content"]) {
+  return content
+    .flatMap((item) => (item.type === "text" ? [item.text] : []))
+    .filter((text) => text.trim().length > 0)
+    .join("\n\n");
 }
 
-function renderToolCall(name: string, args: unknown, theme: RenderTheme) {
+function colorizeToolOutput(value: string, theme: RenderTheme, isError: boolean) {
+  const color = isError ? "error" : "toolOutput";
+  return value.split("\n").map((line) => theme.fg(color, line)).join("\n");
+}
+
+function renderMcpProxyCall(args: unknown, theme: RenderTheme, expanded: boolean) {
+  return renderToolCall(MCP_PROXY_TOOL, args, theme, expanded);
+}
+
+function renderToolCall(name: string, args: unknown, theme: RenderTheme, expanded: boolean) {
   const title = theme.fg("toolTitle", theme.bold(name));
-  const renderedArgs = formatRenderedCallArgs(args);
+  const renderedArgs = formatRenderedCallArgs(args, expanded);
   if (!renderedArgs) return new Text(title, 0, 0);
-  return new Text(`${title}\n${theme.fg("muted", renderedArgs)}`, 0, 0);
+  return expanded ? new Text(`${title}\n${theme.fg("muted", renderedArgs)}`, 0, 0) : new Text(`${title} ${theme.fg("muted", renderedArgs)}`, 0, 0);
 }
 
-function formatRenderedCallArgs(args: unknown) {
-  if (!hasUsefulObjectContent(args)) return "";
-  return formatJsonish(args);
+function formatRenderedCallArgs(args: unknown, expanded: boolean) {
+  if (expanded) {
+    if (!hasUsefulContent(args)) return "";
+    return formatJsonish(args, false);
+  }
+  return formatInlineArgs(args);
 }
 
-function formatJsonish(value: unknown) {
+function formatInlineArgs(args: unknown) {
+  if (!isPlainRecord(args)) return "";
+  const primitives = Object.entries(args).filter(([, value]) =>
+    typeof value === "string" || typeof value === "number" || typeof value === "boolean",
+  );
+  if (primitives.length === 0) return "";
+  return `[${primitives.map(([key, value]) => `${key}=${String(value)}`).join(", ")}]`;
+}
+
+function formatJsonish(value: unknown, truncate = true) {
   let text: string;
   if (typeof value === "string") {
     try {
@@ -892,7 +974,7 @@ function formatJsonish(value: unknown) {
       text = String(value);
     }
   }
-  return truncateText(text, MAX_RENDERED_CALL_ARGS_CHARS);
+  return truncate ? truncateText(text, MAX_RENDERED_CALL_ARGS_CHARS) : text;
 }
 
 function truncateText(value: string, maxChars: number) {
@@ -900,8 +982,8 @@ function truncateText(value: string, maxChars: number) {
   return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
-function hasUsefulObjectContent(value: unknown) {
-  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).length > 0;
+function hasUsefulContent(value: unknown) {
+  return typeof value === "object" && value !== null && (!Array.isArray(value) || value.length > 0) && Object.keys(value).length > 0;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
