@@ -12,35 +12,70 @@ interface LoadOptions {
 
 type ServerEntryMode = "strict" | "discover";
 
-/** Loads the first OpenCode-compatible MCP configuration available for a Pi session. */
+/** Loads the effective OpenCode-compatible MCP configuration for a Pi session. */
 export async function loadMcpConfig(options: LoadOptions): Promise<McpConfig> {
-  const envConfig = process.env.PI_MCP_CONFIG;
-  if (envConfig) {
-    const expanded = resolveHome(expandEnv(envConfig, "PI_MCP_CONFIG"));
-    if (existsSync(expanded)) return parseConfig(await readFile(expanded, "utf8"), expanded);
-    return parseConfig(envConfig, "PI_MCP_CONFIG");
-  }
+  const configs: McpConfig[] = [];
 
   for (const file of candidateConfigFiles(options.cwd)) {
     if (!existsSync(file)) continue;
     const parsed = parseConfig(await readFile(file, "utf8"), file);
-    if (hasConfigContent(parsed)) return parsed;
+    if (hasConfigContent(parsed)) configs.push(parsed);
   }
 
-  return { servers: {} };
+  const envConfig = process.env.PI_MCP_CONFIG;
+  if (envConfig) {
+    const expanded = resolveHome(expandEnv(envConfig, "PI_MCP_CONFIG"));
+    const parsed = existsSync(expanded)
+      ? parseConfig(await readFile(expanded, "utf8"), expanded)
+      : parseConfig(envConfig, "PI_MCP_CONFIG");
+    if (hasConfigContent(parsed)) configs.push(parsed);
+  }
+
+  if (configs.length === 0) return { servers: {} };
+  return finalizeConfig(configs.reduce(mergeConfig, { servers: {} }), configs.map((config) => config.source).filter(isDefined));
 }
 
 function candidateConfigFiles(cwd: string) {
-  return [
-    path.join(cwd, ".pi", "mcp.json"),
-    path.join(cwd, ".pi", "mcp.jsonc"),
-    path.join(cwd, "opencode.json"),
-    path.join(cwd, "opencode.jsonc"),
-    path.join(cwd, ".opencode", "opencode.json"),
-    path.join(cwd, ".opencode", "opencode.jsonc"),
-    path.join(homedir(), ".pi", "agent", "mcp.json"),
-    path.join(homedir(), ".pi", "agent", "mcp.jsonc"),
-  ];
+  const files: string[] = [];
+  const seen = new Set<string>();
+  const directories = ancestorDirectories(cwd);
+
+  const add = (file: string) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    files.push(file);
+  };
+
+  add(path.join(homedir(), ".pi", "agent", "mcp.json"));
+  add(path.join(homedir(), ".pi", "agent", "mcp.jsonc"));
+
+  for (const dir of directories) {
+    add(path.join(dir, "opencode.json"));
+    add(path.join(dir, "opencode.jsonc"));
+  }
+
+  for (const dir of directories) {
+    add(path.join(dir, ".opencode", "opencode.json"));
+    add(path.join(dir, ".opencode", "opencode.jsonc"));
+  }
+
+  for (const dir of directories) {
+    add(path.join(dir, ".pi", "mcp.json"));
+    add(path.join(dir, ".pi", "mcp.jsonc"));
+  }
+
+  return files;
+}
+
+function ancestorDirectories(cwd: string) {
+  const directories: string[] = [];
+  let current = path.resolve(cwd);
+  while (true) {
+    directories.unshift(current);
+    const parent = path.dirname(current);
+    if (parent === current) return directories;
+    current = parent;
+  }
 }
 
 function parseConfig(text: string, source: string): McpConfig {
@@ -76,7 +111,7 @@ function parseMcpSection(section: Record<string, unknown>, source: string, pathL
       throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.servers must be an object`);
     }
     for (const [name, raw] of Object.entries(section.servers)) {
-      servers[name] = parseServer(raw, timeout, `${pathLabel}.servers.${name}`, source);
+      servers[name] = parseServer(raw, `${pathLabel}.servers.${name}`, source);
     }
     return makeConfig(source, servers, timeout, toolMode, startup);
   }
@@ -84,7 +119,7 @@ function parseMcpSection(section: Record<string, unknown>, source: string, pathL
   for (const [name, raw] of Object.entries(section)) {
     if (name === "timeout" || name === "toolMode" || name === "mode" || name === "proxy" || name === "startup") continue;
     if (entryMode === "discover" && !looksLikeServerEntry(raw)) continue;
-    servers[name] = parseServer(raw, timeout, `${pathLabel}.${name}`, source);
+    servers[name] = parseServer(raw, `${pathLabel}.${name}`, source);
   }
 
   return makeConfig(source, servers, timeout, toolMode, startup);
@@ -115,7 +150,7 @@ function parseStartupMode(section: Record<string, unknown>, pathLabel: string, s
   return section.startup;
 }
 
-function parseServer(value: unknown, defaultTimeout: number | undefined, pathLabel: string, source: string): McpServerConfig {
+function parseServer(value: unknown, pathLabel: string, source: string): McpServerConfig {
   if (!isPlainRecord(value)) {
     throw new Error(`Invalid MCP config in ${source}: ${pathLabel} must be an object`);
   }
@@ -123,7 +158,7 @@ function parseServer(value: unknown, defaultTimeout: number | undefined, pathLab
     throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.type must be "local" or "remote"`);
   }
 
-  const timeout = parseOptionalPositiveInt(value.timeout, `${pathLabel}.timeout`, source) ?? defaultTimeout;
+  const timeout = parseOptionalPositiveInt(value.timeout, `${pathLabel}.timeout`, source);
   const enabled = typeof value.enabled === "boolean" ? value.enabled : undefined;
   const disabled = typeof value.disabled === "boolean" ? value.disabled : undefined;
 
@@ -250,6 +285,111 @@ function makeConfig(
   };
 }
 
+function mergeConfig(base: McpConfig, next: McpConfig): McpConfig {
+  const servers = { ...base.servers };
+  for (const [name, server] of Object.entries(next.servers)) {
+    servers[name] = mergeServerConfig(servers[name], server);
+  }
+  return {
+    servers,
+    ...(base.timeout !== undefined ? { timeout: base.timeout } : {}),
+    ...(next.timeout !== undefined ? { timeout: next.timeout } : {}),
+    ...(base.toolMode !== undefined ? { toolMode: base.toolMode } : {}),
+    ...(next.toolMode !== undefined ? { toolMode: next.toolMode } : {}),
+    ...(base.startup !== undefined ? { startup: base.startup } : {}),
+    ...(next.startup !== undefined ? { startup: next.startup } : {}),
+  };
+}
+
+function mergeServerConfig(base: McpServerConfig | undefined, next: McpServerConfig): McpServerConfig {
+  if (!base || base.type !== next.type) return cloneServerConfig(next);
+
+  if (base.type === "local" && next.type === "local") {
+    const environment = mergeStringRecords(base.environment, next.environment);
+    return {
+      ...base,
+      ...next,
+      command: [...next.command],
+      ...(environment !== undefined ? { environment } : {}),
+    };
+  }
+
+  const previous = base as Extract<McpServerConfig, { type: "remote" }>;
+  const current = next as Extract<McpServerConfig, { type: "remote" }>;
+  const headers = mergeStringRecords(previous.headers, current.headers);
+  const oauth = mergeOAuth(previous.oauth, current.oauth);
+  return {
+    ...previous,
+    ...current,
+    ...(headers !== undefined ? { headers } : {}),
+    ...(oauth !== undefined ? { oauth } : {}),
+  };
+}
+
+function mergeStringRecords(
+  base: Readonly<Record<string, string>> | undefined,
+  next: Readonly<Record<string, string>> | undefined,
+): Record<string, string> | undefined {
+  if (base === undefined && next === undefined) return undefined;
+  return {
+    ...(base ?? {}),
+    ...(next ?? {}),
+  };
+}
+
+function mergeOAuth(base: OAuthConfig | false | undefined, next: OAuthConfig | false | undefined): OAuthConfig | false | undefined {
+  if (next === undefined) return cloneOAuth(base);
+  if (next === false) return false;
+  if (base === undefined || base === false) return { ...next };
+  return {
+    ...base,
+    ...next,
+  };
+}
+
+function cloneServerConfig(config: McpServerConfig): McpServerConfig {
+  if (config.type === "local") {
+    return {
+      ...config,
+      command: [...config.command],
+      ...(config.environment !== undefined ? { environment: { ...config.environment } } : {}),
+    };
+  }
+
+  const oauth = cloneOAuth(config.oauth);
+  return {
+    ...config,
+    ...(config.headers !== undefined ? { headers: { ...config.headers } } : {}),
+    ...(oauth !== undefined ? { oauth } : {}),
+  };
+}
+
+function cloneOAuth(config: OAuthConfig | false | undefined): OAuthConfig | false | undefined {
+  if (config === undefined || config === false) return config;
+  return { ...config };
+}
+
+function finalizeConfig(config: McpConfig, sources: string[]): McpConfig {
+  const servers: Record<string, McpServerConfig> = {};
+  for (const [name, server] of Object.entries(config.servers)) {
+    servers[name] =
+      server.timeout === undefined && config.timeout !== undefined
+        ? {
+            ...cloneServerConfig(server),
+            timeout: config.timeout,
+          }
+        : cloneServerConfig(server);
+  }
+
+  return {
+    servers,
+    ...(config.timeout !== undefined ? { timeout: config.timeout } : {}),
+    ...(config.toolMode !== undefined ? { toolMode: config.toolMode } : {}),
+    ...(config.startup !== undefined ? { startup: config.startup } : {}),
+    ...(sources.length > 0 ? { source: sources.join(", ") } : {}),
+  };
+}
+
 function hasConfigContent(config: McpConfig) {
   return (
     Object.keys(config.servers).length > 0 ||
@@ -266,6 +406,10 @@ function looksLikeFlatMcpSection(section: Record<string, unknown>) {
 
 function looksLikeServerEntry(value: unknown) {
   return isPlainRecord(value) && "type" in value;
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
