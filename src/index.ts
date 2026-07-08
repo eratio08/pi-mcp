@@ -37,6 +37,7 @@ interface RenderCallContext {
 }
 
 interface RenderResultContext {
+  args: unknown;
   isError: boolean;
   showImages: boolean;
 }
@@ -890,16 +891,22 @@ function renderToolResult(
   theme: RenderTheme,
   context: RenderResultContext,
 ) {
-  if (!expanded) return new Text("", 0, 0);
+  if (!expanded) {
+    return new Container();
+  }
   if (isPartial) return new Text(theme.fg("warning", "Working..."), 0, 0);
 
+  const fullArgs = formatExpandedCallArgs(context.args);
   const fullText = extractToolText(result.content);
   const images = result.content.filter((item) => item.type === "image");
-  if (!fullText.trim() && images.length === 0) {
+  if (!fullArgs && !fullText.trim() && images.length === 0) {
     return new Text(theme.fg(context.isError ? "error" : "muted", context.isError ? "error" : "done"), 0, 0);
   }
 
   const container = new Container();
+  if (fullArgs) {
+    container.addChild(new Text(theme.fg("muted", fullArgs), 0, 0));
+  }
   if (fullText.trim()) {
     container.addChild(new Text(colorizeToolOutput(fullText, theme, context.isError), 0, 0));
   }
@@ -944,19 +951,14 @@ function renderToolCall(name: string, args: unknown, theme: RenderTheme, context
   const color = context.isError ? "error" : "toolTitle";
   const detailColor = context.isError ? "error" : "muted";
   const title = theme.fg(color, theme.bold(name));
-  const renderedArgs = formatRenderedCallArgs(args, context.expanded);
+  const renderedArgs = formatInlineArgs(args);
   if (!renderedArgs) return new Text(title, 0, 0);
-  return context.expanded
-    ? new Text(`${title}\n${theme.fg(detailColor, renderedArgs)}`, 0, 0)
-    : new Text(`${title} ${theme.fg(detailColor, renderedArgs)}`, 0, 0);
+  return new Text(`${title} ${theme.fg(detailColor, renderedArgs)}`, 0, 0);
 }
 
-function formatRenderedCallArgs(args: unknown, expanded: boolean) {
-  if (expanded) {
-    if (!hasUsefulContent(args)) return "";
-    return formatJsonish(args, false);
-  }
-  return formatInlineArgs(args);
+function formatExpandedCallArgs(args: unknown) {
+  if (!hasUsefulContent(args)) return "";
+  return formatJsonish(args, false);
 }
 
 function formatInlineArgs(args: unknown) {
