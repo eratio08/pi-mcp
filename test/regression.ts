@@ -6,6 +6,7 @@ import path from "node:path";
 import { AuthStore } from "../src/auth-store.js";
 import { loadMcpConfig } from "../src/config.js";
 import { formatMcpServerTarget, redactSecrets } from "../src/display.js";
+import { handlePiElicitation } from "../src/elicitation.js";
 import { McpManager } from "../src/manager.js";
 import type { McpConfig, McpServerConfig } from "../src/types.js";
 import { root } from "./helpers.js";
@@ -29,7 +30,55 @@ async function main() {
   await connectPropagatesCancellation();
   await returnsImmutableManagerSnapshots();
   await propagatesListCancellation();
+  await handlesEmptyFormElicitationConsentDecisions();
   console.log("regression ok");
+}
+
+async function handlesEmptyFormElicitationConsentDecisions() {
+  const cases = [
+    { decision: "Continue", expected: { action: "accept", content: {} } },
+    { decision: "Decline", expected: { action: "decline" } },
+    { decision: undefined, expected: { action: "cancel" } },
+  ];
+
+  for (const testCase of cases) {
+    const prompts: string[] = [];
+    const optionSets: string[][] = [];
+    const ctx = {
+      hasUI: true,
+      ui: {
+        select: async (title: string, options: string[]) => {
+          prompts.push(title);
+          optionSets.push(options);
+          return testCase.decision;
+        },
+        confirm: async (_title: string, _message: string) => false,
+        input: async (_title: string, _placeholder?: string) => undefined,
+        notify: (_message: string) => undefined,
+      },
+    } satisfies NonNullable<Parameters<typeof handlePiElicitation>[2]>;
+
+    const result = await handlePiElicitation(
+      "executor",
+      {
+        method: "elicitation/create",
+        params: {
+          mode: "form",
+          message: "Approve Executor tool call?",
+          requestedSchema: {
+            type: "object",
+            properties: {},
+            required: [],
+          },
+        },
+      },
+      ctx,
+    );
+
+    assert.deepEqual(result, testCase.expected);
+    assert.deepEqual(optionSets[0], ["Continue", "Decline"]);
+    assert.equal(prompts[0], "MCP Input Request\nServer: executor\n\nApprove Executor tool call?");
+  }
 }
 
 async function rejectsInvalidServerConfig() {

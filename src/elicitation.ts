@@ -2,7 +2,10 @@ import { ElicitResultSchema, type ElicitRequest, type ElicitResult } from "@mode
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import open from "open";
 
-type PiElicitationContext = Pick<ExtensionContext, "hasUI" | "ui">;
+type PiElicitationContext = {
+  readonly hasUI: ExtensionContext["hasUI"];
+  readonly ui: Pick<ExtensionContext["ui"], "confirm" | "input" | "notify" | "select">;
+};
 type ElicitationContent = NonNullable<ElicitResult["content"]>;
 
 const CANCEL = Symbol("cancel");
@@ -47,7 +50,10 @@ async function handleFormElicitation(
 ): Promise<ElicitResult> {
   if (!ctx?.hasUI) return { action: "decline" };
 
-  ctx.ui.notify(`MCP ${server}: ${params.message}`, "info");
+  const decision = await ctx.ui.select(`MCP Input Request\nServer: ${server}\n\n${params.message}`, ["Continue", "Decline"]);
+  if (decision === "Decline") return { action: "decline" };
+  if (decision !== "Continue") return { action: "cancel" };
+
   const required = new Set(params.requestedSchema.required ?? []);
   const content: ElicitationContent = {};
 
