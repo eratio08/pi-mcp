@@ -1,7 +1,7 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { Client, StreamableHTTPClientTransport, SSEClientTransport, UnauthorizedError } from "@modelcontextprotocol/client";
+import { Client, StreamableHTTPClientTransport, SSEClientTransport, UnauthorizedError, OAuthError } from "@modelcontextprotocol/client";
 import type { ClientOptions, ElicitRequest, ElicitResult, LoggingMessageNotification, Prompt, Resource, Tool } from "@modelcontextprotocol/client";
 import open from "open";
 import type {
@@ -686,7 +686,13 @@ export class McpManager {
     await this.options.onToolsChanged?.(name);
   }
 
-  private async startAuth(name: string) {
+  private async startAuth(name: string, retried = false): Promise<{
+    authorizationUrl: string;
+    oauthState: string;
+    callbackPromise: Promise<URLSearchParams>;
+    client?: Client;
+    transport?: TransportWithAuth;
+  }> {
     const serverConfig = this.requireRemote(name);
     if (serverConfig.oauth === false) throw new Error(`MCP server ${name} has OAuth disabled`);
 
@@ -727,6 +733,11 @@ export class McpManager {
       if (transport) await safeCloseTransport(transport);
       this.oauthCallbacks.cancel(name);
       await callbackPromise.catch(() => undefined);
+      if (!retried && error instanceof OAuthError && (await this.auth.getForUrl(name, serverConfig.url))?.tokens) {
+        this.deactivateOAuthProviders(name);
+        await this.auth.clearTokens(name);
+        return this.startAuth(name, true);
+      }
       throw error;
     }
   }

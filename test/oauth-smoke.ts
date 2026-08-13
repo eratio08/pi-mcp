@@ -91,6 +91,18 @@ async function main() {
     assert.equal(statsAfterRefresh.refreshGrants, 1);
     assert.ok(statsAfterRefresh.protectedRequests >= 2);
 
+    await auth.updateTokens(
+      "oauth",
+      { accessToken: "stale-access", refreshToken: "stale-refresh", issuer: new URL(fixture.url).origin },
+      fixture.url,
+    );
+    const statusAfterStaleRefresh = await manager.authenticate("oauth");
+    assert.equal(statusAfterStaleRefresh.status, "connected");
+    const statsAfterReauth = await fixtureStats(fixture.statsUrl);
+    assert.equal(statsAfterReauth.authorizationCodeGrants, statsAfterRefresh.authorizationCodeGrants + 1);
+    assert.ok((await auth.get("oauth"))?.tokens?.refreshToken);
+    assert.notEqual((await auth.get("oauth"))?.tokens?.refreshToken, "stale-refresh");
+
     await rejectsInvalidCallbackIssuer(fixture, tempDir, "mismatch");
     await rejectsInvalidCallbackIssuer(fixture, tempDir, "missing");
 
